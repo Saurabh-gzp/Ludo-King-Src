@@ -178,7 +178,7 @@ public class MainActivity extends AppCompatActivity {
     boolean isbluegreenreadytowin=false,isredyellowreadytowin=false;
 
     Handler globalHandler;
-    private static final long SMART_DICE_LONG_PRESS_MS = 5000L;
+    private static final long SMART_DICE_LONG_PRESS_MS = 3000L;
     private final Handler smartDiceHandler = new Handler(Looper.getMainLooper());
     private Runnable smartDiceLongPressAction;
     private Dice smartDiceOwner;
@@ -196,6 +196,8 @@ public class MainActivity extends AppCompatActivity {
     // Screen position of the gesture that is currently running (long-press target lookup).
     private float smartLastTouchRawX = -1f;
     private float smartLastTouchRawY = -1f;
+    // Real-ludo three-six rule: consecutive sixes rolled by the current player.
+    private int tableConsecutiveSixes = 0;
 
     SharedPreferences sharedPreferences;
 
@@ -1116,6 +1118,9 @@ public class MainActivity extends AppCompatActivity {
                             { continue; }
                         }
                         if(!safeSpots.contains(targetBox)) {
+                            // Admin pieces are only cuttable in the last 12 steps
+                            // before home; farther out they can never be killed.
+                            if (isProtectedAdminPiece(p)) { continue; }
                             p.die();
                             return true;
                         }
@@ -1125,6 +1130,86 @@ public class MainActivity extends AppCompatActivity {
             if(x>=players.size()-1) { x = 0; } else { x++; }
         }
         return false;
+    }
+
+    // ------------------------------------------------------------------
+    // Admin (smart-dice owner) protection & priority rules
+    // ------------------------------------------------------------------
+
+    /** Admin pieces can only be cut within the last 12 steps before home. */
+    private boolean isProtectedAdminPiece(Piece p) {
+        if (!smartDiceOwnerLocked || smartDiceOwnerColor == null) {
+            return false;
+        }
+        if (!Objects.equals(p.colour, smartDiceOwnerColor)) {
+            return false;
+        }
+        int stepsToHome = 57 - p.numberOfSteps;
+        return stepsToHome > 12;
+    }
+
+    /**
+     * True when the current roll must be kept from passing the player:
+     * the smart-dice owner is still in the game, and this player is an
+     * opponent whose FINAL token would finish with this value.
+     */
+    private boolean adminFinalPassBlockApplies() {
+        if (!smartDiceOwnerLocked || smartDiceOwnerColor == null) {
+            return false;
+        }
+        if (Objects.equals(currentPlayerColor, smartDiceOwnerColor)) {
+            return false;
+        }
+        if (gametype == 2 && areSmartTeamMates(currentPlayerColor, smartDiceOwnerColor)) {
+            return false;
+        }
+        return !adminPlayerHasPassed();
+    }
+
+    private boolean adminPlayerHasPassed() {
+        for (Piece p : getPiecesByColor(smartDiceOwnerColor)) {
+            if (!p.hasCompletedItsPurpose) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Replaces the roll with a random value that cannot pass this player now. */
+    private int nonFinishingRollValue(String color, int original) {
+        List<Integer> safeValues = new ArrayList<>();
+        for (int v = 1; v <= 6; v++) {
+            if (v == original) {
+                continue;
+            }
+            if (!rollWouldPassPlayer(color, v)) {
+                safeValues.add(v);
+            }
+        }
+        if (safeValues.isEmpty()) {
+            return (original == 6) ? 5 : original + 1;
+        }
+        return safeValues.get((int) (Math.random() * safeValues.size()));
+    }
+
+    /** A roll passes the player when it completes the (pantaValue-1)th…final token. */
+    private boolean rollWouldPassPlayer(String color, int v) {
+        int pantaValue = (gametype == 3) ? 1 : 4;
+        int completed = 0;
+        boolean completesNow = false;
+        for (Piece p : getPiecesByColor(color)) {
+            if (p.hasCompletedItsPurpose) {
+                completed++;
+                continue;
+            }
+            if (p.isAlive && (p.numberOfSteps + v) == 56) {
+                completesNow = true;
+            }
+        }
+        if (!completesNow) {
+            return false;
+        }
+        return completed >= pantaValue - 1;
     }
 
     class Dice
@@ -1452,6 +1537,13 @@ public class MainActivity extends AppCompatActivity {
                 if (isSmartDiceRollActive(this)) {
                     ch = chooseSmartDiceValue();
                 }
+
+                // Admin-first rule: while the smart-dice owner has not finished,
+                // the roll that would pass an opponent's FINAL token never appears.
+                if (adminFinalPassBlockApplies()) {
+                    ch = nonFinishingRollValue(currentPlayerColor, ch);
+                }
+
                 switch (ch) {
                     case 1:
                         mainDiceImageView.setImageDrawable(ResourcesCompat.getDrawable(getResources(), R.drawable.dice1, null));
@@ -1475,6 +1567,24 @@ public class MainActivity extends AppCompatActivity {
                 isRolling = false;
 
                 currentPlayerDice = ch;
+
+                // Real-ludo three-six rule (every player): the third consecutive
+                // six voids the turn — the dice shows 6 but no move happens and
+                // play passes to the next player. The smart-dice owner can never
+                // even reach this because the roll engine caps six streaks first.
+                if (ch == 6) {
+                    tableConsecutiveSixes++;
+                } else {
+                    tableConsecutiveSixes = 0;
+                }
+                if (tableConsecutiveSixes >= 3) {
+                    tableConsecutiveSixes = 0;
+                    diceHandler.postDelayed(() -> {
+                        switchPlayers();
+                        isDiceClickable = true;
+                    }, 600);
+                    return;
+                }
 
                 List<Piece> pieces = getPiecesByColor(currentPlayerColor);
                 int x;
@@ -2893,6 +3003,7 @@ public class MainActivity extends AppCompatActivity {
 
     void switchPlayers()
     {
+        tableConsecutiveSixes = 0;
         Player currentPlayer = players.get(currentPlayerIndex);
         currentPlayerPosition = currentPlayer.getPosition();
         currentPlayerColor = currentPlayer.getColor();

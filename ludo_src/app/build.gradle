@@ -10,8 +10,8 @@ android {
         applicationId "ludo.king.my"
         minSdk 21
         targetSdk 36
-        versionCode 1564
-        versionName "8.0.0.280"
+        versionCode 1565
+        versionName "8.0.0.281"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }

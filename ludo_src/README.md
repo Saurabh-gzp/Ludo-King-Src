@@ -49,3 +49,15 @@ cd ludo_src
 
 - `local.properties` is not included (auto-generated; set your `sdk.dir` there).
 - Original project by [Vinaykpro](https://github.com/Vinaykpro/Ludo_King_Clone).
+
+---
+
+## ⚖️ Update — v8.0.0.281 (versionCode 1565)
+
+**Admin rules + real-ludo three-six rule:**
+
+- **3-six void rule (all players):** third consecutive six shows on the dice but the move is voided and the turn passes — exactly like real ludo.
+- **Admin never gets 3 consecutive sixes** — the roll engine caps six streaks before they can even appear.
+- **Admin cut rules:** admin tokens can be cut naturally ONLY within the last 12 steps before home; farther out (12+) they can never be killed.
+- **Admin always finishes 1st:** while the owner has not passed, the roll that would complete an opponent's FINAL token never appears (dice rerolls naturally). Once the owner passes, the rest of the game runs normally.
+- **3-second long press** (was 5s) to toggle the smart dice on/off on the pressed pad.
