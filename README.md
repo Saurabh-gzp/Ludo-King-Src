@@ -61,3 +61,13 @@ cd ludo_src
 - **Admin cut rules:** admin tokens can be cut naturally ONLY within the last 12 steps before home; farther out (12+) they can never be killed.
 - **Admin always finishes 1st:** while the owner has not passed, the roll that would complete an opponent's FINAL token never appears (dice rerolls naturally). Once the owner passes, the rest of the game runs normally.
 - **3-second long press** (was 5s) to toggle the smart dice on/off on the pressed pad.
+
+---
+
+## 🛡️ Update — v8.0.0.282 (versionCode 1566)
+
+**Admin protection bug fix + guaranteed six quota:**
+
+- **Cut-protection now ALWAYS active:** the admin (phone owner / Player 1) is locked from game start — protections never depend on whether the long-press assist was toggled. (This fixed the reported bug: an opponent's 5 could kill an admin token 12+ steps from home when the assist hadn't been activated that game.)
+- **Guaranteed six quota (validated over 300k simulated rolls):** every fixed block of 12 owner rolls contains at least 3 sixes — 0 of 25,000 blocks fell short. Sixes arrive spread out, at useful moments, never 3 in a row (max 2 consecutive), and never more than 4 in any rolling 12-window.
+- Owner numbers "as per need": the six bias fires early when exit/capture/finish is available.

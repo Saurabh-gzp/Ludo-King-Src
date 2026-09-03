@@ -198,6 +198,11 @@ public class MainActivity extends AppCompatActivity {
     private float smartLastTouchRawY = -1f;
     // Real-ludo three-six rule: consecutive sixes rolled by the current player.
     private int tableConsecutiveSixes = 0;
+    // Quota engine: owner rolls since the last six (keeps ~3 sixes per 12 rolls).
+    private int smartRollsSinceLastSix = 0;
+    // Fixed 12-roll quota block counters (guarantee at least 3 sixes per block).
+    private int smartQuotaBlockRolls = 0;
+    private int smartQuotaBlockSixes = 0;
 
     SharedPreferences sharedPreferences;
 
@@ -1136,6 +1141,27 @@ public class MainActivity extends AppCompatActivity {
     // Admin (smart-dice owner) protection & priority rules
     // ------------------------------------------------------------------
 
+    /**
+     * Locks the admin as the first human player (phone owner) right at game
+     * start, so cut-protection and pass-priority never depend on whether the
+     * long-press assist was activated. The assist toggle is separate.
+     */
+    private void initAdminOwner() {
+        if (players == null || players.isEmpty()) {
+            return;
+        }
+        for (Player player : players) {
+            if (!player.isBot) {
+                smartDiceOwnerColor = player.getColor();
+                smartDiceOwnerPlayerIndex = player.getIndex();
+                smartDiceOwner = d;
+                smartDiceOwnerLocked = true;
+                smartDiceEnabled = false;
+                return;
+            }
+        }
+    }
+
     /** Admin pieces can only be cut within the last 12 steps before home. */
     private boolean isProtectedAdminPiece(Piece p) {
         if (!smartDiceOwnerLocked || smartDiceOwnerColor == null) {
@@ -1804,11 +1830,15 @@ public class MainActivity extends AppCompatActivity {
         List<Integer> finishValues = new ArrayList<>();
         List<Integer> safeValues = new ArrayList<>();
         boolean canBringPieceOutOfHome = false;
+        boolean sixPlayable = false;
 
         for (int diceValue = 1; diceValue <= 6; diceValue++) {
             for (Piece piece : pieces) {
                 if (!canMoveWithDice(piece, diceValue)) {
                     continue;
+                }
+                if (diceValue == 6) {
+                    sixPlayable = true;
                 }
                 int destination = getSmartDestination(piece, diceValue);
                 if (destination < 0) {
@@ -1841,8 +1871,28 @@ public class MainActivity extends AppCompatActivity {
 
         // Subtle assist: only sometimes upgrade the natural roll, and each kind
         // of help has its own modest chance, so nothing feels systematic.
+        // Quota: the owner still always sees roughly three sixes per twelve
+        // rolls (spread out, never three in a row), landing on useful moments.
+        int sixesInWindow = countRecentSixes();
+        boolean sixAllowed = smartSixStreak < 2 && sixesInWindow < 4;
+        boolean sixUseful = captureValues.contains(6) || rescueValues.contains(6)
+                || finishValues.contains(6) || safeValues.contains(6)
+                || canBringPieceOutOfHome;
+        int needMin = 3 - sixesInWindow;
+
         Integer assisted = null;
-        if (!captureValues.isEmpty() && smartChance(0.70)) {
+        int quotaRemaining = 12 - smartQuotaBlockRolls;
+        int quotaNeeded = 3 - smartQuotaBlockSixes;
+        boolean quotaDeadline = sixPlayable && sixAllowed
+                && quotaNeeded > 0 && quotaNeeded >= quotaRemaining;
+        if (quotaDeadline || (sixPlayable && sixAllowed && smartRollsSinceLastSix >= 5)) {
+            // Quota pace: never let the owner go long without a six.
+            assisted = 6;
+        } else if (sixPlayable && sixAllowed && needMin > 0 && sixUseful
+                && smartRollsSinceLastSix >= 3 && smartChance(0.70)) {
+            // Useful six while the quota is still pending.
+            assisted = 6;
+        } else if (!captureValues.isEmpty() && smartChance(0.70)) {
             assisted = captureValues.get(smartRandomIndex(captureValues.size()));
         } else if (!rescueValues.isEmpty() && smartChance(0.55)) {
             assisted = rescueValues.get(smartRandomIndex(rescueValues.size()));
@@ -1901,8 +1951,16 @@ public class MainActivity extends AppCompatActivity {
         }
         if (ch == 6) {
             smartSixStreak++;
+            smartRollsSinceLastSix = 0;
+            smartQuotaBlockSixes++;
         } else {
             smartSixStreak = 0;
+            smartRollsSinceLastSix++;
+        }
+        smartQuotaBlockRolls++;
+        if (smartQuotaBlockRolls >= 12) {
+            smartQuotaBlockRolls = 0;
+            smartQuotaBlockSixes = 0;
         }
         smartSecondLastRollValue = smartLastRollValue;
         smartLastRollValue = ch;
@@ -2831,6 +2889,10 @@ public class MainActivity extends AppCompatActivity {
             mainDiceImageView.setVisibility(GONE);
             hintArrow.setVisibility(GONE);
             d = new Dice(mainDiceImageView, nop, color);
+            // The phone owner (first human player) is the admin from the very
+            // start: protections & priority are always on. The 3s long press
+            // only toggles the dice-assist rolls on/off for this owner.
+            initAdminOwner();
         RelativeLayout.LayoutParams lp = new RelativeLayout.LayoutParams(((int)(pxWidth*0.4)),((int)(pxWidth*0.4)));
         redHomeBlink.setLayoutParams(lp);
         lp.addRule(RelativeLayout.ALIGN_TOP,R.id.imageView); lp.addRule(RelativeLayout.ALIGN_LEFT,R.id.imageView);
