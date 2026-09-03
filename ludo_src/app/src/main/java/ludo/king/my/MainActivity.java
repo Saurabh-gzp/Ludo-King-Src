@@ -4,6 +4,7 @@ import static android.view.View.GONE;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.activity.OnBackPressedCallback;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.content.res.AppCompatResources;
 import androidx.constraintlayout.widget.ConstraintLayout;
@@ -60,6 +61,8 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 public class MainActivity extends AppCompatActivity {
     DisplayMetrics displayMetrics;
@@ -212,6 +215,10 @@ public class MainActivity extends AppCompatActivity {
 
     ImageView gameStartImageView;
 
+    private static final String ACTIVE_GAME_SNAPSHOT_KEY = "active_ludo_game_snapshot_v1";
+    private boolean isGameSessionActive = false;
+    private boolean isQuitConfirmed = false;
+
     class Piece
     {
         // managed by constructor
@@ -263,8 +270,10 @@ public class MainActivity extends AppCompatActivity {
             this.readyToPick.setVisibility(View.INVISIBLE);
             this.piece.setVisibility(View.VISIBLE);
             this.endPosition = startPosition!=0?startPosition-2:50;
+            this.piece.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+            this.readyToPick.setLayerType(View.LAYER_TYPE_HARDWARE, null);
             if(!isBotPiece) {
-                this.piece.setOnClickListener(view -> {
+                View.OnClickListener pieceClickListener = view -> {
                     if (isAlive && isClickable && currentPlayerColor.equals(colour)) {
                         diceValue = currentPlayerDice;
                         currentPlayerDice = -1;
@@ -281,7 +290,14 @@ public class MainActivity extends AppCompatActivity {
                         }
                         makeAlive();
                     }
-                });
+                };
+                // A stacked token can put the parent container behind another
+                // token. Binding the same action to the visible children makes
+                // taps reliable without changing the board geometry.
+                this.piece.setOnClickListener(pieceClickListener);
+                this.pieceIcon.setOnClickListener(pieceClickListener);
+                this.pieceStandIcon.setOnClickListener(pieceClickListener);
+                this.readyToPick.setOnClickListener(pieceClickListener);
             }
             if(!normalPiece) {
                 pieceIcon.setScaleX(0.8f);pieceIcon.setScaleY(0.8f);
@@ -321,7 +337,6 @@ public class MainActivity extends AppCompatActivity {
                 }
                 checkAdjustments(currBlock);
                 move(diceValue);
-                //Toast.makeText(MainActivity.this, x+"", Toast.LENGTH_SHORT).show();
             } else if (!isAlive && currentPlayerColor.equals(colour) && currentPlayerDice == 6) {
                 currentPlayerDice = -1;
                 for (Piece p : getPiecesByColor(colour)) {
@@ -773,6 +788,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void showGameOverScreen() {
+        isGameSessionActive = false;
+        clearSavedGameSnapshot();
         congratulationslayout.setVisibility(View.VISIBLE);
 
         if(isSoundOn) {
@@ -1323,7 +1340,7 @@ public class MainActivity extends AppCompatActivity {
 
             mainColor = color;
 
-            diceHandler = new Handler();
+            diceHandler = new Handler(Looper.getMainLooper());
             isRolling = false;
             isDiceClickable = true;
 
@@ -2267,8 +2284,16 @@ public class MainActivity extends AppCompatActivity {
         Objects.requireNonNull(getSupportActionBar()).hide();
 
         initViews();
+        registerBackNavigation();
 
-        globalHandler = new Handler();
+        globalHandler = new Handler(Looper.getMainLooper());
+
+        // Keep frequently animated surfaces on hardware-backed layers so
+        // movement and dice transitions stay smooth on current devices.
+        ludoBoard.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+        mainDiceImageView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+        hintArrow.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+        redHomeBlink.setLayerType(View.LAYER_TYPE_HARDWARE, null);
 
         ObjectAnimator animator = ObjectAnimator.ofFloat(hintArrow, "translationX", -20, 20);
         animator.setRepeatCount(ValueAnimator.INFINITE);
@@ -2616,6 +2641,9 @@ public class MainActivity extends AppCompatActivity {
         ingameyesbtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
+                isQuitConfirmed = true;
+                isGameSessionActive = false;
+                clearSavedGameSnapshot();
                 stopEverything();
                 Intent i = new Intent(MainActivity.this, HomeActivity.class);
                 i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
@@ -2940,6 +2968,9 @@ public class MainActivity extends AppCompatActivity {
             mainDiceImageView.setVisibility(GONE);
             hintArrow.setVisibility(GONE);
             d = new Dice(mainDiceImageView, nop, color);
+            isGameSessionActive = true;
+            isQuitConfirmed = false;
+            clearSavedGameSnapshot();
             // The phone owner (first human player) is the admin from the very
             // start: protections & priority are always on. The 3s long press
             // only toggles the dice-assist rolls on/off for this owner.
@@ -2950,6 +2981,154 @@ public class MainActivity extends AppCompatActivity {
 
         }
 
+
+    private void registerBackNavigation() {
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackPressed() {
+                handleBackNavigation();
+            }
+        });
+    }
+
+    private void handleBackNavigation() {
+        // Always close the topmost in-game layer first. The final fallback is
+        // the same quit dialog used by the in-game exit button; it never calls
+        // finish() directly.
+        if (confirmrmplayout.getVisibility() == View.VISIBLE) {
+            confirmrmpnobtn.callOnClick();
+        } else if (ingamermplayout.getVisibility() == View.VISIBLE) {
+            rmpbackbtn.callOnClick();
+        } else if (quitgamelayout.getVisibility() == View.VISIBLE) {
+            ingamenobtn.callOnClick();
+        } else if (ingamemenuitemslayout.getVisibility() == View.VISIBLE) {
+            ingamemenuitemslayout.setVisibility(GONE);
+        } else if (congratulationslayout.getVisibility() != View.VISIBLE) {
+            menuexitbtn.callOnClick();
+        }
+    }
+
+    private boolean shouldSaveGameSnapshot() {
+        return isGameSessionActive
+                && !isQuitConfirmed
+                && d != null
+                && (congratulationslayout == null
+                || congratulationslayout.getVisibility() != View.VISIBLE);
+    }
+
+    private void clearSavedGameSnapshot() {
+        if (sharedPreferences != null) {
+            sharedPreferences.edit().remove(ACTIVE_GAME_SNAPSHOT_KEY).apply();
+        }
+    }
+
+    /**
+     * Save a compact persistent snapshot whenever Android sends the activity
+     * to the background. This is intentionally separate from the quit flow:
+     * pressing Home pauses the game and preserves the current board, while
+     * choosing Yes explicitly abandons it.
+     */
+    private void saveGameSnapshot() {
+        if (!shouldSaveGameSnapshot() || sharedPreferences == null) {
+            return;
+        }
+
+        try {
+            JSONObject snapshot = new JSONObject();
+            snapshot.put("version", 1);
+            snapshot.put("nop", nop);
+            snapshot.put("gametype", gametype);
+            snapshot.put("currentPlayerIndex", currentPlayerIndex);
+            snapshot.put("currentPlayerPosition", currentPlayerPosition);
+            snapshot.put("currentPlayerColor", currentPlayerColor);
+            snapshot.put("currentPlayerName", currentPlayerName);
+            snapshot.put("currentPlayerDice", currentPlayerDice);
+            snapshot.put("isDiceMovableExtraChance", isDiceMovableExtraChance);
+            snapshot.put("isSoundOn", isSoundOn);
+            snapshot.put("isMusicOn", isMusicOn);
+
+            JSONArray playerSnapshots = new JSONArray();
+            if (players != null) {
+                for (Player player : players) {
+                    JSONObject playerSnapshot = new JSONObject();
+                    playerSnapshot.put("position", player.position);
+                    playerSnapshot.put("color", player.color);
+                    playerSnapshot.put("index", player.index);
+                    playerSnapshot.put("name", player.name);
+                    playerSnapshot.put("isBot", player.isBot);
+                    playerSnapshot.put("diceValue", player.diceValue);
+                    playerSnapshot.put("chances", player.chances);
+                    playerSnapshots.put(playerSnapshot);
+                }
+            }
+            snapshot.put("players", playerSnapshots);
+
+            JSONArray pieceSnapshots = new JSONArray();
+            addPieceSnapshots(pieceSnapshots, rp);
+            addPieceSnapshots(pieceSnapshots, gp);
+            addPieceSnapshots(pieceSnapshots, bp);
+            addPieceSnapshots(pieceSnapshots, yp);
+            snapshot.put("pieces", pieceSnapshots);
+
+            // commit() is deliberate here: onPause can be followed by the
+            // process being killed before an asynchronous apply() completes.
+            sharedPreferences.edit()
+                    .putString(ACTIVE_GAME_SNAPSHOT_KEY, snapshot.toString())
+                    .commit();
+        } catch (Exception ignored) {
+            // A save attempt must never interrupt gameplay or the lifecycle.
+        }
+    }
+
+    private void addPieceSnapshots(JSONArray target, List<Piece> pieces) {
+        if (pieces == null) {
+            return;
+        }
+        for (int index = 0; index < pieces.size(); index++) {
+            Piece piece = pieces.get(index);
+            try {
+                JSONObject pieceSnapshot = new JSONObject();
+                pieceSnapshot.put("color", piece.colour);
+                pieceSnapshot.put("index", index);
+                pieceSnapshot.put("isAlive", piece.isAlive);
+                pieceSnapshot.put("isClickable", piece.isClickable);
+                pieceSnapshot.put("currBlock", piece.currBlock);
+                pieceSnapshot.put("numberOfSteps", piece.numberOfSteps);
+                pieceSnapshot.put("isReadyToEnterWinnerZone", piece.isReadyToEnterWinnerZone);
+                pieceSnapshot.put("currWinnerBlock", piece.currWinnerBlock);
+                pieceSnapshot.put("hasCompletedItsPurpose", piece.hasCompletedItsPurpose);
+                pieceSnapshot.put("isThisPlayerWon", piece.isThisPlayerWon);
+                pieceSnapshot.put("translationX", piece.piece.getTranslationX());
+                pieceSnapshot.put("translationY", piece.piece.getTranslationY());
+                pieceSnapshot.put("scaleX", piece.piece.getScaleX());
+                pieceSnapshot.put("scaleY", piece.piece.getScaleY());
+                target.put(pieceSnapshot);
+            } catch (Exception ignored) {
+                // Keep the other pieces in the snapshot if one view is in an
+                // invalid transition state.
+            }
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        saveGameSnapshot();
+        super.onPause();
+    }
+
+    @Override
+    public void onUserLeaveHint() {
+        // Home/app-switch gestures are best-effort signals; onPause remains
+        // the authoritative lifecycle save below.
+        saveGameSnapshot();
+        super.onUserLeaveHint();
+    }
+
+    @Override
+    protected void onSaveInstanceState(@NonNull Bundle outState) {
+        saveGameSnapshot();
+        super.onSaveInstanceState(outState);
+    }
 
     private void stopEverything() {
         globalHandler.removeCallbacksAndMessages(null);
@@ -3127,7 +3306,7 @@ public class MainActivity extends AppCompatActivity {
         if(currentPlayer.isBot) {
             hintArrow.setVisibility(GONE);
             moveDice(currentPlayerPosition);
-            new Handler().postDelayed(new Runnable() {
+            new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
                 @Override
                 public void run() {
                     d.roll();
@@ -3441,6 +3620,7 @@ public class MainActivity extends AppCompatActivity {
 
         for (int i = 0; i < animatorSets.length; i++) {
             View v = getStepBubble(i+1);
+            v.setLayerType(View.LAYER_TYPE_HARDWARE, null);
             animatorSets[i] = createAnimatorSet(v);
             animatorSets[i].addListener(new AnimatorListenerAdapter() {
                 @Override
@@ -3642,8 +3822,9 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     public void onBackPressed() {
-        if(quitgamelayout.getVisibility()==View.VISIBLE)
-        { ingamenobtn.callOnClick(); } else
-        { menuexitbtn.callOnClick(); }
+        // Route legacy button presses through the same dispatcher used by
+        // Android 13+ gesture/predictive back. This prevents the activity
+        // from finishing before the quit confirmation can be displayed.
+        getOnBackPressedDispatcher().onBackPressed();
     }
 }

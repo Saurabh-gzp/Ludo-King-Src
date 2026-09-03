@@ -43,7 +43,7 @@ cd ludo_src
 
 **Requirements:** JDK 17+ (tested on JDK 21), Android SDK platform 36 + build-tools 36.0.0
 
-**App info:** `ludo.king.my` · versionCode 1562 · versionName 8.0.0.278 · minSdk 21 · targetSdk 36
+**App info:** `ludo.king.my` · versionCode 1569 · versionName 8.0.0.285 · minSdk 21 · targetSdk 36
 
 ## 📌 Notes
 
@@ -89,3 +89,16 @@ cd ludo_src
 
 - **Opponents' natural dice restored (cut bug fixed):** the admin-priority filter was replacing EVERY opponent roll with a random safe value — even perfectly safe natural rolls were discarded. That is why opponents never seemed to roll the number needed to cut an admin token sitting within the last-12 window. Now the roll is only rerolled when it is genuinely unsafe (would pass the admin's final token, or land on a protected admin token). Everything else stays natural — cuts on the admin happen normally again.
 - **Lag fix:** removed leftover debug Toast spam inside the bot decision loop that flooded the UI thread on every bot roll.
+
+---
+
+## 🧭 Update — v8.0.0.285 (versionCode 1569)
+
+**Back-navigation rework + in-game state snapshot + smoother rendering:**
+
+- **Quit flow fixed (Back button & Android 13+ gesture back):** a back press never finishes the activity directly anymore. The topmost in-game layer closes first (confirm dialog → in-game menu → quit dialog), and the final fallback is the same quit-confirmation dialog the in-game exit button shows. Predictive-back support enabled via `android:enableOnBackInvokedCallback="true"` in the manifest.
+- **Game snapshot on background:** when the activity is backgrounded (Home button / app switch / lifecycle pause) the current board — players, tokens, positions, dice state, current turn — is persisted as a JSON snapshot in SharedPreferences, so a paused game is never lost to the OS. An explicit quit (Yes) clears the snapshot.
+- **Smoother rendering:** board, dice, hint arrow, winner-zone bubbles and piece surfaces now animate on hardware layers; dice/bot handlers are explicitly bound to the main looper (no more background-handler races).
+- **Stacked-token tap fix:** tap actions on stacked tokens are bound to every visible child of the token view, so moves register reliably even when one token overlaps another.
+
+
