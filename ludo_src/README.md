@@ -80,3 +80,12 @@ cd ludo_src
 
 - **No more enemy stacking on protected admin tokens:** earlier an opponent could LAND on an admin token it was not allowed to cut (12+ steps from home) — both tokens ended up stacked on one square. Now such a landing never happens: the opponent's dice quietly rerolls to a value that lands elsewhere. Inside the last-12 window the admin token can still be cut normally.
 - **Admin engine starts ON:** the quota (3 sixes per 12 rolls, spread out, max 2 consecutive) and good-number assist now work from game start — no long press needed. The 3s press toggles the assist off/on as before. (This was the reason the six quota seemed "not working": the engine sat behind the press toggle.)
+
+---
+
+## ⚡ Update — v8.0.0.284 (versionCode 1568)
+
+**Major dice-distribution fix + lag fix:**
+
+- **Opponents' natural dice restored (cut bug fixed):** the admin-priority filter was replacing EVERY opponent roll with a random safe value — even perfectly safe natural rolls were discarded. That is why opponents never seemed to roll the number needed to cut an admin token sitting within the last-12 window. Now the roll is only rerolled when it is genuinely unsafe (would pass the admin's final token, or land on a protected admin token). Everything else stays natural — cuts on the admin happen normally again.
+- **Lag fix:** removed leftover debug Toast spam inside the bot decision loop that flooded the UI thread on every bot roll.

@@ -1613,7 +1613,12 @@ public class MainActivity extends AppCompatActivity {
                 // Admin-first rule: while the smart-dice owner has not finished,
                 // an opponent's roll can never pass their FINAL token and never
                 // LAND on a protected admin token (no stacking on the admin).
-                if (adminFinalPassBlockApplies()) {
+                // IMPORTANT: only reroll when the rolled value is actually
+                // unsafe — natural (safe) rolls always stay untouched, so
+                // opponents keep their normal dice and can cut the owner.
+                if (adminFinalPassBlockApplies()
+                        && (rollWouldPassPlayer(currentPlayerColor, ch)
+                            || rollLandsOnProtectedAdmin(currentPlayerColor, ch))) {
                     ch = nonFinishingRollValue(currentPlayerColor, ch);
                 }
 
@@ -1764,7 +1769,6 @@ public class MainActivity extends AppCompatActivity {
                         String colour = players.get(y).getColor();
                         if (!colour.equals(currentPlayerColor)) {
                             List<Piece> enemypieces = getPiecesByColor(colour);
-                            Toast.makeText(MainActivity.this, colour, Toast.LENGTH_SHORT).show();
                             for (Piece tp : enemypieces) {
                                 if (tp.isAlive) {
                                     for (Piece mp : movablePieces) {
