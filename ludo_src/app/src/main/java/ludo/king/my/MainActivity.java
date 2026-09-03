@@ -1156,7 +1156,9 @@ public class MainActivity extends AppCompatActivity {
                 smartDiceOwnerPlayerIndex = player.getIndex();
                 smartDiceOwner = d;
                 smartDiceOwnerLocked = true;
-                smartDiceEnabled = false;
+                // Assist (quota sixes + good numbers) starts ON for the admin;
+                // the 3s long press toggles it off/on.
+                smartDiceEnabled = true;
                 return;
             }
         }
@@ -1201,21 +1203,65 @@ public class MainActivity extends AppCompatActivity {
         return true;
     }
 
-    /** Replaces the roll with a random value that cannot pass this player now. */
+    /** Replaces the roll with a random value that neither passes this player
+     *  nor lands on a protected admin token (no enemy stacking on the admin). */
     private int nonFinishingRollValue(String color, int original) {
         List<Integer> safeValues = new ArrayList<>();
         for (int v = 1; v <= 6; v++) {
             if (v == original) {
                 continue;
             }
-            if (!rollWouldPassPlayer(color, v)) {
-                safeValues.add(v);
+            if (rollWouldPassPlayer(color, v)) {
+                continue;
             }
+            if (rollLandsOnProtectedAdmin(color, v)) {
+                continue;
+            }
+            safeValues.add(v);
         }
         if (safeValues.isEmpty()) {
+            List<Integer> noPass = new ArrayList<>();
+            for (int v = 1; v <= 6; v++) {
+                if (v != original && !rollWouldPassPlayer(color, v)) {
+                    noPass.add(v);
+                }
+            }
+            if (!noPass.isEmpty()) {
+                return noPass.get((int) (Math.random() * noPass.size()));
+            }
             return (original == 6) ? 5 : original + 1;
         }
         return safeValues.get((int) (Math.random() * safeValues.size()));
+    }
+
+    /**
+     * An opponent roll may never LAND exactly on a protected admin token's
+     * square: the kill is blocked by rule, so the landing itself is blocked
+     * too — otherwise the enemy would visually stack on top of the admin.
+     */
+    private boolean rollLandsOnProtectedAdmin(String color, int v) {
+        if (!smartDiceOwnerLocked || smartDiceOwnerColor == null) {
+            return false;
+        }
+        if (Objects.equals(color, smartDiceOwnerColor)) {
+            return false;
+        }
+        for (Piece mine : getPiecesByColor(color)) {
+            if (!mine.isAlive || mine.hasCompletedItsPurpose) {
+                continue;
+            }
+            int destination = getSmartDestination(mine, v);
+            if (destination < 0 || destination >= 52) {
+                continue;
+            }
+            for (Piece adminPiece : getPiecesByColor(smartDiceOwnerColor)) {
+                if (adminPiece.isAlive && adminPiece.currBlock == destination
+                        && isProtectedAdminPiece(adminPiece)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /** A roll passes the player when it completes the (pantaValue-1)th…final token. */
@@ -1565,7 +1611,8 @@ public class MainActivity extends AppCompatActivity {
                 }
 
                 // Admin-first rule: while the smart-dice owner has not finished,
-                // the roll that would pass an opponent's FINAL token never appears.
+                // an opponent's roll can never pass their FINAL token and never
+                // LAND on a protected admin token (no stacking on the admin).
                 if (adminFinalPassBlockApplies()) {
                     ch = nonFinishingRollValue(currentPlayerColor, ch);
                 }

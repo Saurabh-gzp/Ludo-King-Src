@@ -71,3 +71,12 @@ cd ludo_src
 - **Cut-protection now ALWAYS active:** the admin (phone owner / Player 1) is locked from game start — protections never depend on whether the long-press assist was toggled. (This fixed the reported bug: an opponent's 5 could kill an admin token 12+ steps from home when the assist hadn't been activated that game.)
 - **Guaranteed six quota (validated over 300k simulated rolls):** every fixed block of 12 owner rolls contains at least 3 sixes — 0 of 25,000 blocks fell short. Sixes arrive spread out, at useful moments, never 3 in a row (max 2 consecutive), and never more than 4 in any rolling 12-window.
 - Owner numbers "as per need": the six bias fires early when exit/capture/finish is available.
+
+---
+
+## 🔧 Update — v8.0.0.283 (versionCode 1567)
+
+**Stacking bug fix + assist now always on for the admin:**
+
+- **No more enemy stacking on protected admin tokens:** earlier an opponent could LAND on an admin token it was not allowed to cut (12+ steps from home) — both tokens ended up stacked on one square. Now such a landing never happens: the opponent's dice quietly rerolls to a value that lands elsewhere. Inside the last-12 window the admin token can still be cut normally.
+- **Admin engine starts ON:** the quota (3 sixes per 12 rolls, spread out, max 2 consecutive) and good-number assist now work from game start — no long press needed. The 3s press toggles the assist off/on as before. (This was the reason the six quota seemed "not working": the engine sat behind the press toggle.)
