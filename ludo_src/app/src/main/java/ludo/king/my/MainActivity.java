@@ -1250,9 +1250,18 @@ public class MainActivity extends AppCompatActivity {
                 }
                 space = 0;
                 //scale = 0.70f;
+                // ELEVATION FIX (horizontal branch): boost the current player's
+                // piece so it renders on top — fixes the click-through bug.
+                float currentElevationBonusH = 100f;
+                float baseElevationH = pairs.get(0).piece.getElevation();
                 for (int i = 0; i < n; i++) {
                     Piece p = pairs.get(i);
                     ConstraintLayout piece = p.piece;
+                    float elev = baseElevationH + i;
+                    if (currentPlayerColor != null && currentPlayerColor.equals(p.colour)) {
+                        elev += currentElevationBonusH;
+                    }
+                    piece.setElevation(elev);
                     piece.setScaleX(scale);
                     piece.setScaleY(scale);
                     piece.setTranslationX(xt - ((blockSize - (pieceWidth * scale)) / 2) + ((pieceWidth * scale * 0.30f) * i) - (extra * scale * (n / 2)) + space);
@@ -1271,10 +1280,29 @@ public class MainActivity extends AppCompatActivity {
                 }
                 space = 0;
                 //scale = 0.70f;
+                // ELEVATION FIX: previously every piece got elevation++ in
+                // pairs.get(i) order — so the first piece (always the current
+                // player's piece, because pairs is built starting from
+                // currentPlayerIndex) got the LOWEST elevation and ended up
+                // rendered UNDER the opponent's pieces. Taps then landed on the
+                // opponent's piece on top, swallowing the click. Now we boost
+                // the current player's piece with a LARGE elevation bonus so
+                // it always renders on top — the user can always tap their own
+                // piece even when stacked with opponents.
+                float currentElevationBonus = 100f;  // big enough to dominate
                 for (int i = 0; i < n; i++) {
                     Piece p = pairs.get(i);
                     ConstraintLayout piece = p.piece;
-                    piece.setElevation(elevation++);
+                    // Current player's piece gets a big elevation bonus so it
+                    // renders on top of opponent's pieces — fixes the
+                    // click-through bug where the user tapped their own piece
+                    // but the opponent's piece (rendered on top) swallowed the
+                    // tap.
+                    float elev = elevation++;
+                    if (currentPlayerColor != null && currentPlayerColor.equals(p.colour)) {
+                        elev += currentElevationBonus;
+                    }
+                    piece.setElevation(elev);
                     piece.setScaleX(scale);
                     piece.setScaleY(scale);
                     piece.setTranslationX(xt);
@@ -2730,8 +2758,24 @@ public class MainActivity extends AppCompatActivity {
                 return p;
             }
         }
-        // Second pass: if no clickable piece at this exact cell, return null
-        // (the tap was on a piece that genuinely can't be moved).
+        // Second pass: if no clickable piece, try any of our pieces at this
+        // cell. The caller (click handler) will check isAlive && isClickable
+        // again and decide whether to move it (or do nothing if it genuinely
+        // can't move). This handles the case where the user taps an opponent's
+        // piece that is stacked on top of OUR piece at the same cell — even
+        // if our piece isn't currently "highlighted" by check(), we should
+        // still let our click listener decide what to do.
+        for (Piece p : pieces) {
+            if (p != null && !p.isBotPiece && p.isAlive && p.currBlock == cellBlock) {
+                return p;
+            }
+        }
+        // Also handle the home-pieces case: if any of our pieces is in home
+        // (currBlock == -1 or currBlock == startPosition) AND the dice is 6,
+        // we should be able to bring it out. But the click landing on an
+        // opponent's piece can't tell us the cell — the cell of the
+        // opponent's piece is on the board, not our home. So this case is
+        // handled by the user tapping the home piece directly.
         return null;
     }
 
