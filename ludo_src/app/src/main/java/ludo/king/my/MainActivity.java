@@ -337,6 +337,13 @@ public class MainActivity extends AppCompatActivity {
             this.piece.setTranslationY(defY);
             this.readyToPick.setVisibility(View.INVISIBLE);
             this.piece.setVisibility(View.VISIBLE);
+            // ORIGINAL GAME FIX: hide the inner-circle ring (pieceStandIcon).
+            // This was a thin black circle outline that appeared under EVERY
+            // piece — making it look like every piece was "selected/active".
+            // The real Ludo King has no such permanent ring; pieces are pure
+            // colored discs. Hiding it removes the visual confusion (and
+            // matches the real game).
+            this.pieceStandIcon.setVisibility(View.INVISIBLE);
             this.endPosition = startPosition!=0?startPosition-2:50;
             // NOTE: hardware layers are now toggled in activeState() /
             // inactiveState() so we don't keep 32 GPU textures live for the
@@ -348,16 +355,25 @@ public class MainActivity extends AppCompatActivity {
                     // CLICK-THROUGH FIX: if this piece is NOT the current
                     // player's, the tap might have landed on an opponent's
                     // piece that was stacked on top of OUR piece at the same
-                    // cell. In that case, find OUR movable piece at this
-                    // cell and dispatch the click to it instead of silently
-                    // swallowing the tap.
+                    // cell, OR visually near our piece in a tight cluster
+                    // (ahead/behind/side-by-side). In either case, find OUR
+                    // movable piece and dispatch the click to it instead of
+                    // silently swallowing the tap.
                     if (!currentPlayerColor.equals(colour)) {
-                        // This is an opponent's piece. See if any of the
-                        // CURRENT player's pieces shares this cell and is
-                        // clickable — if so, redirect the tap there.
+                        // First try: same-cell redirect (exact cell match).
                         Piece ours = findCurrentPlayerPieceAtCell(this.currBlock);
                         if (ours != null && ours != this) {
                             ours.piece.performClick();
+                            return;
+                        }
+                        // Second try: distance-based fallback. The tap may
+                        // have landed on an opponent's piece that is rendered
+                        // NEAR our piece (e.g. our piece in front of, behind,
+                        // or beside the opponent's piece, in adjacent cells).
+                        // Find our closest clickable piece within tolerance.
+                        Piece nearest = findNearestCurrentPlayerPieceTo(this);
+                        if (nearest != null && nearest != this) {
+                            nearest.piece.performClick();
                             return;
                         }
                         // No current-player piece here — silently ignore.
@@ -2777,6 +2793,58 @@ public class MainActivity extends AppCompatActivity {
         // opponent's piece is on the board, not our home. So this case is
         // handled by the user tapping the home piece directly.
         return null;
+    }
+
+    /**
+     * TOUCH RESPONSE FIX: find the current player's piece that is NEAREST to
+     * the given piece's screen position (within a tolerance). This is the
+     * fallback when no current-player piece shares the exact cell — handles
+     * the case where the user taps an opponent's piece that is rendered
+     * visually NEAR our piece (ahead/behind/side-by-side) but on a different
+     * cell. The user's tap should still go to OUR piece.
+     *
+     * Distance is measured by Euclidean distance between the piece views'
+     * screen positions.
+     *
+     * Returns null if no current-player piece is within tolerance OR no
+     * current-player piece is alive+clickable.
+     */
+    private Piece findNearestCurrentPlayerPieceTo(Piece referencePiece) {
+        if (currentPlayerColor == null || referencePiece == null
+                || referencePiece.piece == null) { return null; }
+        List<Piece> pieces = getPiecesByColor(currentPlayerColor);
+        if (pieces == null || pieces.isEmpty()) { return null; }
+
+        // Get the reference piece's screen position.
+        int[] refLoc = new int[2];
+        referencePiece.piece.getLocationOnScreen(refLoc);
+        float refX = refLoc[0] + referencePiece.piece.getWidth() / 2f;
+        float refY = refLoc[1] + referencePiece.piece.getHeight() / 2f;
+        if (refX == 0 && refY == 0) { return null; }
+
+        // Tolerance: 1.5x piece width — this covers "ahead/behind/side-by-side"
+        // when pieces are clustered tightly. Pieces in adjacent cells are
+        // within this distance.
+        float tolerance = pieceWidth * 1.5f;
+        Piece nearest = null;
+        float nearestDist = Float.MAX_VALUE;
+
+        for (Piece p : pieces) {
+            if (p == null || p.isBotPiece || !p.isAlive || !p.isClickable) { continue; }
+            if (p.piece == null) { continue; }
+            int[] pLoc = new int[2];
+            p.piece.getLocationOnScreen(pLoc);
+            float pX = pLoc[0] + p.piece.getWidth() / 2f;
+            float pY = pLoc[1] + p.piece.getHeight() / 2f;
+            float dx = pX - refX;
+            float dy = pY - refY;
+            float dist = (float) Math.sqrt(dx * dx + dy * dy);
+            if (dist < nearestDist && dist <= tolerance) {
+                nearestDist = dist;
+                nearest = p;
+            }
+        }
+        return nearest;
     }
 
     class Player {
