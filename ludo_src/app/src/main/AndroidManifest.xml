@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Vibration for silent admin-activation haptic feedback (the user
+         feels a short pulse when admin is activated/toggled, but opponents
+         watching the screen see nothing). Normal permission — no prompt. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"

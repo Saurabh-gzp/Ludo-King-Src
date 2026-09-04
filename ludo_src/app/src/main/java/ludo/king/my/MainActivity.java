@@ -32,6 +32,9 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import android.os.VibratorManager;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
 import android.view.MotionEvent;
@@ -1880,10 +1883,56 @@ public class MainActivity extends AppCompatActivity {
         private void showAdminToast(Player admin) {
             // Toast removed — opponents could see "Admin: <name> (RED)" and
             // realize the hack is on. Silent activation is much safer.
+            // Instead, give the user a haptic feedback (vibration) so they
+            // KNOW the admin activated — silent for opponents, felt by user.
+            vibrateAdminActivated();
         }
 
         private void showAdminToggleToast(Player admin, boolean nowEnabled, boolean wasEnabled) {
             // Toast removed — same reason. The admin toggle is now silent.
+            // Different vibration pattern for ON vs OFF so the user knows.
+            if (nowEnabled != wasEnabled) {
+                if (nowEnabled) {
+                    vibrateAdminActivated();  // single short pulse
+                } else {
+                    vibrateAdminToggledOff();  // double short pulse
+                }
+            }
+        }
+
+        // Haptic feedback for admin activation. Only the user feels this —
+        // opponents watching the screen see nothing.
+        private void vibrateAdminActivated() {
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    VibratorManager vm = (VibratorManager) MainActivity.this.getSystemService(MainActivity.VIBRATOR_MANAGER_SERVICE);
+                    if (vm != null && vm.getDefaultVibrator() != null) {
+                        vm.getDefaultVibrator().vibrate(VibrationEffect.createOneShot(60, VibrationEffect.DEFAULT_AMPLITUDE));
+                    }
+                } else {
+                    Vibrator v = (Vibrator) MainActivity.this.getSystemService(MainActivity.VIBRATOR_SERVICE);
+                    if (v != null && v.hasVibrator()) {
+                        v.vibrate(VibrationEffect.createOneShot(60, VibrationEffect.DEFAULT_AMPLITUDE));
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+
+        private void vibrateAdminToggledOff() {
+            try {
+                long[] pattern = {0, 40, 60, 40};
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    VibratorManager vm = (VibratorManager) MainActivity.this.getSystemService(MainActivity.VIBRATOR_MANAGER_SERVICE);
+                    if (vm != null && vm.getDefaultVibrator() != null) {
+                        vm.getDefaultVibrator().vibrate(VibrationEffect.createWaveform(pattern, -1));
+                    }
+                } else {
+                    Vibrator v = (Vibrator) MainActivity.this.getSystemService(MainActivity.VIBRATOR_SERVICE);
+                    if (v != null && v.hasVibrator()) {
+                        v.vibrate(VibrationEffect.createWaveform(pattern, -1));
+                    }
+                }
+            } catch (Exception ignored) {}
         }
 
         boolean isCurrentPlayerBindable() {
@@ -1900,15 +1949,19 @@ public class MainActivity extends AppCompatActivity {
             isDiceClickable = false;
             isDiceMovableExtraChance = false;
             if(isSoundOn && diceRollSound != null) {
-                // Simpler hot-path: seekTo+start. The previous pause+seekTo+start
-                // was creating AudioTrack churn on every roll.
+                // Restart the dice roll sound on EVERY roll. The previous
+                // code checked 'isPlaying()' and skipped the restart if the
+                // sound was still going — but the dice roll sound is ~470ms
+                // long and the dice animation is only 350ms, so consecutive
+                // rolls (e.g. in a fast bot sequence) were silent. Forcibly
+                // pause+seekTo+start so EVERY roll has its sound (matching
+                // the real Ludo King app).
                 try {
                     if (diceRollSound.isPlaying()) {
-                        // Let it finish naturally — overlapping rolls sound fine.
-                    } else {
-                        diceRollSound.seekTo(5);
-                        diceRollSound.start();
+                        diceRollSound.pause();
                     }
+                    diceRollSound.seekTo(5);
+                    diceRollSound.start();
                 } catch (Exception ignored) {}
             }
             mainDiceImageView.setImageDrawable(diceAnimationDrawable);
