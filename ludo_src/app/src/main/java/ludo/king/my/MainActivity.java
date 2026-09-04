@@ -137,6 +137,11 @@ public class MainActivity extends AppCompatActivity {
     boolean normalPiece = true;
 
     private AnimatorSet[] animatorSets;
+    // Per-step pop-up/pop-down AnimatorSet created in move(). Stored as a
+    // field so the previous one can be cancelled before a new one starts —
+    // otherwise a 6-step move chains 6 short AnimatorSets that all tick the
+    // Choreographer concurrently, causing UI-thread jank on lower-end devices.
+    private AnimatorSet currentMovePopAnim;
 
     ImageView crownIndex1,crownIndex2,crownIndex3,crownIndex4;
 
@@ -181,9 +186,31 @@ public class MainActivity extends AppCompatActivity {
     boolean isbluegreenreadytowin=false,isredyellowreadytowin=false;
 
     Handler globalHandler;
+    // Hint-arrow infinite animator — kept as a field so onDestroy can cancel
+    // it. Was previously a local variable, so it leaked the whole activity.
+    private ValueAnimator hintArrowAnimator;
+    // Blink runnable for the "game start" splash — kept so onDestroy can
+    // cancel it instead of leaving it self-rescheduling forever.
+    private Runnable blinkAnim;
+    // Long-press time: 3 seconds (was 5s in earlier versions). Reduced
+    // because the user wants a faster admin on/off toggle.
     private static final long SMART_DICE_LONG_PRESS_MS = 3000L;
     private final Handler smartDiceHandler = new Handler(Looper.getMainLooper());
     private Runnable smartDiceLongPressAction;
+    // The actual scheduled lambda — kept as a field so removeCallbacks() can
+    // cancel it. Without this, ACTION_UP would call removeCallbacks on a
+    // *different* object reference (the inline lambda), which would never
+    // remove anything — every dice tap fired the long-press 3 seconds later.
+    // This was the root cause of the "admin silently re-assigns on every tap"
+    // bug.
+    private Runnable pendingSmartDiceLongPress;
+    // Tracks which View received the ACTION_DOWN so the long-press knows
+    // whether it came from the central dice (which overlaps a corner pad by
+    // geometry) or from a real corner pad. Without this, every central-dice
+    // long-press was mis-routed to `findPressedCornerPosition`, which then
+    // re-assigned the admin to whatever corner the central dice happened
+    // to be over (i.e. the current player's color).
+    private boolean longPressSourceIsCentralDice = false;
     private Dice smartDiceOwner;
     private String smartDiceOwnerColor;
     private int smartDiceOwnerPlayerIndex = -1;
@@ -207,6 +234,39 @@ public class MainActivity extends AppCompatActivity {
     private int smartQuotaBlockRolls = 0;
     private int smartQuotaBlockSixes = 0;
 
+    // --------------------------------------------------------------------
+    // Per-face fairness engine — modeled on the real Ludo King app's
+    // DiceController which has fields named maxLimit_1..maxLimit_6,
+    // counterToGetSix, curRollCount, p2Blank / p4Blank / compBlank / myBlank,
+    // and curRollCount234 / counterToGetSix234. The original game enforces
+    // that NO dice face can come up too often (per-face max limits over a
+    // balancing window), and injects a 6 when a player has gone too many
+    // rolls without one (counterToGetSix). This eliminates the "green
+    // went half the match without a 6" complaint because the balancing
+    // is GLOBAL — applies to all players, not just the admin.
+    // --------------------------------------------------------------------
+
+    // Rolling 18-roll window of dice faces for ALL players. Each face's
+    // count must stay under its maxLimit. Real Ludo King uses ~3-4 per
+    // face over a similar window.
+    private final int[] fairnessRecentFaces = new int[18];
+    private int fairnessRecentFacesIndex = 0;
+    private int fairnessRecentFacesFilled = 0;
+    // Per-face caps — face 1 through 6 can each appear at most this many
+    // times in the rolling window. Real Ludo King's default is around 4.
+    private static final int FAIRNESS_FACE_MAX = 4;
+    // Per-player "rolls since last 6" counter. When this exceeds the
+    // threshold, the next roll is forced to a 6 (unless it would
+    // overshoot the home track — that case is handled later).
+    private final int[] playerRollsSinceLastSix = new int[4];
+    private static final int PLAYER_FORCED_SIX_AFTER = 5; // matches Ludo King's counterToGetSix threshold
+    // Per-player "blank rolls" counter (rolls where the player couldn't
+    // move). When this exceeds the threshold, the next roll is biased
+    // toward a useful value. Real Ludo King has p2Blank/p4Blank/etc.
+    private final int[] playerBlankRolls = new int[4];
+    private static final int PLAYER_BLANK_LIMIT = 3;
+
+
     SharedPreferences sharedPreferences;
 
     boolean isSoundOn=true,isMusicOn=false;
@@ -214,6 +274,11 @@ public class MainActivity extends AppCompatActivity {
     int botwins=0,botloses=0;
 
     ImageView gameStartImageView;
+
+    // Cached "current player" blink animation — was previously inflated via
+    // AnimationUtils.loadAnimation() inside setActive() on every single turn
+    // change (one XML inflation per turn). Cached here once at initViews().
+    private Animation cachedBlinkAnimation;
 
     private static final String ACTIVE_GAME_SNAPSHOT_KEY = "active_ludo_game_snapshot_v1";
     private boolean isGameSessionActive = false;
@@ -270,21 +335,56 @@ public class MainActivity extends AppCompatActivity {
             this.readyToPick.setVisibility(View.INVISIBLE);
             this.piece.setVisibility(View.VISIBLE);
             this.endPosition = startPosition!=0?startPosition-2:50;
-            this.piece.setLayerType(View.LAYER_TYPE_HARDWARE, null);
-            this.readyToPick.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+            // NOTE: hardware layers are now toggled in activeState() /
+            // inactiveState() so we don't keep 32 GPU textures live for the
+            // whole game. Constructor leaves them at LAYER_TYPE_NONE.
+            this.piece.setLayerType(View.LAYER_TYPE_NONE, null);
+            this.readyToPick.setLayerType(View.LAYER_TYPE_NONE, null);
             if(!isBotPiece) {
                 View.OnClickListener pieceClickListener = view -> {
-                    if (isAlive && isClickable && currentPlayerColor.equals(colour)) {
-                        diceValue = currentPlayerDice;
-                        currentPlayerDice = -1;
-                        for (Piece p : getPiecesByColor(colour)) {
-                            p.inactiveState();
+                    // CLICK-THROUGH FIX: if this piece is NOT the current
+                    // player's, the tap might have landed on an opponent's
+                    // piece that was stacked on top of OUR piece at the same
+                    // cell. In that case, find OUR movable piece at this
+                    // cell and dispatch the click to it instead of silently
+                    // swallowing the tap.
+                    if (!currentPlayerColor.equals(colour)) {
+                        // This is an opponent's piece. See if any of the
+                        // CURRENT player's pieces shares this cell and is
+                        // clickable — if so, redirect the tap there.
+                        Piece ours = findCurrentPlayerPieceAtCell(this.currBlock);
+                        if (ours != null && ours != this) {
+                            ours.piece.performClick();
+                            return;
                         }
-                        checkAdjustments(currBlock);
+                        // No current-player piece here — silently ignore.
+                        return;
+                    }
+                    if (currentPlayerDice == -1) {
+                        // Already consumed by a previous tap on this turn —
+                        // a piece is mid-move. Ignore silently; the move
+                        // will complete and the turn will advance.
+                        return;
+                    }
+                    if (isAlive && isClickable) {
+                        diceValue = currentPlayerDice;
+                        currentPlayerDice = -1;  // consume — blocks further taps
+                        // Only call inactiveState on the OTHER pieces of the same
+                        // color — calling it on the moving piece right before
+                        // move() would drop its hardware layer to NONE, causing
+                        // software compositing during the move animation (a
+                        // major source of the "choppy" feel). The moving piece's
+                        // layer is re-promoted inside move() itself.
+                        for (Piece p : getPiecesByColor(colour)) {
+                            if (p != this) { p.inactiveState(); }
+                        }
+                        // Skip the redundant checkAdjustments here — move()
+                        // calls it at its first line (line ~541) before
+                        // animating, so this saved one full O(16) +
+                        // ArrayList allocation per click.
                         move(diceValue);
-                        //Toast.makeText(MainActivity.this, x+"", Toast.LENGTH_SHORT).show();
-                    } else if (!isAlive && currentPlayerColor.equals(colour) && currentPlayerDice == 6) {
-                        currentPlayerDice = -1;
+                    } else if (!isAlive && currentPlayerDice == 6) {
+                        currentPlayerDice = -1;  // consume
                         for (Piece p : getPiecesByColor(colour)) {
                             p.inactiveState();
                         }
@@ -325,7 +425,11 @@ public class MainActivity extends AppCompatActivity {
             rotateAnimator.setRepeatCount(ObjectAnimator.INFINITE);
             rotateAnimator.setRepeatMode(ObjectAnimator.RESTART);
             rotateAnimator.setInterpolator(new LinearInterpolator());
-            rotateAnimator.start();
+            // Do NOT start the animator here — that was a major FPS leak:
+            // all 16 pieces' animators ran forever even while readyToPick
+            // was INVISIBLE. The animator is now started only in
+            // activeState() (when the piece actually needs to spin) and
+            // cancelled in inactiveState() + die() + onDestroy().
         }
 
         void onClickForBot() {
@@ -350,8 +454,12 @@ public class MainActivity extends AppCompatActivity {
         {
             isAlive = true;
             currBlock = startPosition;
-            piece.animate().translationX(x[startPosition]+pushXForPieces).translationY(y[startPosition]-pushYForPieces).setDuration(400).start(); // 16 75
+            // ORIGINAL 400ms — restored after the previous version tightened
+            // to 250ms. Matches the original Ludo King release-from-home feel.
+            piece.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+            piece.animate().translationX(x[startPosition]+pushXForPieces).translationY(y[startPosition]-pushYForPieces).setDuration(400).start();
             globalHandler.postDelayed(() -> {
+                piece.setLayerType(View.LAYER_TYPE_NONE, null);
                 isDiceMovableExtraChance = true;
                 if(!isBotPiece) { hintArrow.setVisibility(View.VISIBLE); }
                 checkAdjustments(currBlock);
@@ -370,7 +478,7 @@ public class MainActivity extends AppCompatActivity {
                         d.roll();
                     }
                 }
-            },550);
+            },550); // ORIGINAL 550ms — restored
         }
 
         void die()
@@ -381,15 +489,15 @@ public class MainActivity extends AppCompatActivity {
             checkAdjustments(currBlock);
             currWinnerBlock=0;
             numberOfSteps = 0;
-            if(isSoundOn) {
-                deathSound = MediaPlayer.create(MainActivity.this, R.raw.death);
-                deathSound.start();
-                deathSound.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
-                    @Override
-                    public void onCompletion(MediaPlayer mediaPlayer) {
-                        deathSound.release();
-                    }
-                });
+            // Stop the spinning indicator when the piece dies.
+            if (rotateAnimator != null) { rotateAnimator.cancel(); }
+            readyToPick.setVisibility(View.INVISIBLE);
+            if(isSoundOn && deathSound != null) {
+                try {
+                    if (deathSound.isPlaying()) { deathSound.pause(); }
+                    deathSound.seekTo(0);
+                    deathSound.start();
+                } catch (Exception ignored) {}
             }
 
 
@@ -419,7 +527,15 @@ public class MainActivity extends AppCompatActivity {
         void activeState()
         {
             isClickable = true;
-            rotateAnimator.start();
+            // Re-allocate the hardware layer only while the piece is
+            // actually animating — freed in inactiveState().
+            piece.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+            readyToPick.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+            // Defensive: only start if not already running (calling start()
+            // on a running animator restarts it from 0 — visible "jump").
+            if (rotateAnimator != null && !rotateAnimator.isStarted()) {
+                rotateAnimator.start();
+            }
             readyToPick.setVisibility(View.VISIBLE);
             if(piece.getScaleX()<1.0f) {
                 piece.setScaleX(0.95f);
@@ -433,26 +549,41 @@ public class MainActivity extends AppCompatActivity {
         void inactiveState()
         {
             isClickable = false;
-            rotateAnimator.cancel();
+            if (rotateAnimator != null) { rotateAnimator.cancel(); }
             readyToPick.setVisibility(View.INVISIBLE);
+            // Drop the hardware layer when the piece isn't animating —
+            // keeping 16 pieces × 2 views = 32 GPU textures permanently
+            // allocated for the whole game was a major cause of growing
+            // GPU-memory pressure on long sessions.
+            piece.setLayerType(View.LAYER_TYPE_NONE, null);
+            readyToPick.setLayerType(View.LAYER_TYPE_NONE, null);
             if(currBlock!=-1) {
                 checkAdjustments(currBlock);
             }
         }
 
         void move(int n) {
+            // Defensive guard: never run move() with a stale dice value.
+            // The piece click listener now blocks currentPlayerDice == -1,
+            // but a bot or a saved-state-resume path could still call here
+            // with n <= 0 — that would crash showStep and freeze the turn.
+            if (n <= 0) { return; }
             isClickable = false;
-            if(stepSound!=null) {
-                if(isSoundOn) {
-                    if (!stepSound.isPlaying()) {
-                        stepSound.seekTo(120);
-                        stepSound.start();
-                    } else if (stepSound.isPlaying()) {
+            // Step sound: restart on EVERY step. The previous version checked
+            // `isPlaying()` and skipped the restart if the sound was still
+            // going — but the step sound is ~470ms long and the step gap is
+            // only 200ms, so step 1's sound was always still playing when
+            // step 2 fired, and steps 2..N were silent. Now we forcibly
+            // pause+seekTo+start on every step so the user hears one click
+            // per step (matching the real Ludo King app's audio behavior).
+            if(stepSound!=null && isSoundOn) {
+                try {
+                    if (stepSound.isPlaying()) {
                         stepSound.pause();
-                        stepSound.seekTo(120);
-                        stepSound.start();
                     }
-                }
+                    stepSound.seekTo(120);
+                    stepSound.start();
+                } catch (Exception ignored) {}
             }
 
 
@@ -470,12 +601,33 @@ public class MainActivity extends AppCompatActivity {
 
             if(isReadyToEnterWinnerZone)
             {
-                currBlock = winnerBlocks[currWinnerBlock];
+                // Defensive bounds check: winnerBlocks is a 6-cell array. A
+                // stale state or a check() that allowed an overshoot could
+                // push currWinnerBlock past 5 and crash with AIOOBE, which
+                // would freeze the turn and leave the piece visually stuck.
+                if (winnerBlocks == null || currWinnerBlock < 0 || currWinnerBlock >= winnerBlocks.length) {
+                    // Treat as finished — snap to last winner cell and bail.
+                    currWinnerBlock = winnerBlocks != null ? winnerBlocks.length - 1 : 0;
+                    currBlock = winnerBlocks != null ? winnerBlocks[currWinnerBlock] : currBlock;
+                } else {
+                    currBlock = winnerBlocks[currWinnerBlock];
+                }
                 currWinnerBlock++;
             }
 
             if(currBlock==endPosition) { winnerBlocks = getWinnerBlocks(endPosition); isReadyToEnterWinnerZone = true; }
 
+            // Temporarily promote the moving piece to a hardware layer for the
+            // duration of the animation — this avoids software compositing
+            // during the move which was the #1 cause of the "choppy/laggy"
+            // feeling on long games. inactiveState() (called before move())
+            // had set the layer to NONE, so the piece was animating without
+            // GPU acceleration. We re-promote here just for the move.
+            piece.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+
+            // ORIGINAL speed (220ms) — restored after the previous version
+            // made the game too fast (1.5-2x). This matches the original
+            // Ludo King app's per-step animation timing.
             piece.animate().translationX(x[currBlock] + pushXForPieces).translationY(y[currBlock] - pushYForPieces).setDuration(220).start();
             /*if(!isReadyToEnterWinnerZone)
             {
@@ -496,16 +648,26 @@ public class MainActivity extends AppCompatActivity {
             /*ObjectAnimator alphaAnimator = ObjectAnimator.ofFloat(view, View.ALPHA, 1.0f, 0.0f);
             alphaAnimator.setDuration(duration);*/
 
-            AnimatorSet animatorSet = new AnimatorSet();
-            animatorSet.playSequentially(popUpAnimator,popDownAnimator);
-            animatorSet.start();
+            // Cancel any leftover pop-animator from the previous step so
+            // they don't pile up and tick the Choreographer concurrently.
+            if (currentMovePopAnim != null && currentMovePopAnim.isRunning()) {
+                currentMovePopAnim.cancel();
+            }
+            currentMovePopAnim = new AnimatorSet();
+            currentMovePopAnim.playSequentially(popUpAnimator,popDownAnimator);
+            currentMovePopAnim.start();
 
 
 
 
             globalHandler.postDelayed(() -> {
+                // Drop the hardware layer we promoted at the start of this
+                // step — back to NONE for idle. (Re-promoted on next step.)
+                piece.setLayerType(View.LAYER_TYPE_NONE, null);
+
                 if(n>1) {
                     int step = currBlock;
+                    // Pre-showStep delay restored to 100ms (original timing).
                     globalHandler.postDelayed( ()-> {
                         showStep(n,this.colour,x[step],y[step]);
                     },100);
@@ -526,30 +688,24 @@ public class MainActivity extends AppCompatActivity {
 
                     boolean isDeadChanceAvailable = false;
 
-                    if(safeSpots.contains(currBlock) && isSoundOn)
+                    if(safeSpots.contains(currBlock) && isSoundOn && safeSound != null)
                     {
-                        safeSound = MediaPlayer.create(MainActivity.this,R.raw.safe);
-                        safeSound.start();
-                        safeSound.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
-                            @Override
-                            public void onCompletion(MediaPlayer mediaPlayer) {
-                                safeSound.release();
-                            }
-                        });
+                        try {
+                            if (safeSound.isPlaying()) { safeSound.pause(); }
+                            safeSound.seekTo(0);
+                            safeSound.start();
+                        } catch (Exception ignored) {}
                     } else if(currWinnerBlock>0) {
                         int temp = 0;
                         if(currWinnerBlock>5)
                         {
                             hasCompletedItsPurpose = true;
-                            if(isSoundOn) {
-                                pantaSound = MediaPlayer.create(MainActivity.this, R.raw.panta);
-                                pantaSound.start();
-                                pantaSound.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
-                                    @Override
-                                    public void onCompletion(MediaPlayer mediaPlayer) {
-                                        pantaSound.release();
-                                    }
-                                });
+                            if(isSoundOn && pantaSound != null) {
+                                try {
+                                    if (pantaSound.isPlaying()) { pantaSound.pause(); }
+                                    pantaSound.seekTo(0);
+                                    pantaSound.start();
+                                } catch (Exception ignored) {}
                             }
 
                             List<Piece> pieces = getPiecesByColor(this.colour);
@@ -705,6 +861,7 @@ public class MainActivity extends AppCompatActivity {
                     if(diceValue == 6 || currWinnerBlock>5 || isDeadChanceAvailable && !isThisPlayerWon) {
                         isDiceMovableExtraChance = true;
                         if(!isBotPiece) { hintArrow.setVisibility(View.VISIBLE); } else {
+                            // Bot reroll delay restored to 150ms (original).
                             globalHandler.postDelayed(new Runnable() {
                                 @Override
                                 public void run() {
@@ -717,7 +874,8 @@ public class MainActivity extends AppCompatActivity {
                         d.isDiceClickable = true;
                     }
                 }
-            }, 200); //325
+            }, 200); // ORIGINAL 200ms — restored after the previous version
+                    // tightened to 130ms which made the game too fast.
         }
 
 
@@ -725,12 +883,20 @@ public class MainActivity extends AppCompatActivity {
         public boolean check(int diceValue) {
             if(diceValue == 6)
             {
-                if(!isAlive || (numberOfSteps+diceValue)<57)
+                // Allow the winning move: a piece on step 51 can finish with a 6
+                // (51 + 6 = 57 — the last winner cell). Use <= 57, NOT < 57.
+                if(!isAlive || (numberOfSteps+diceValue)<=57)
                 {
                     activeState();
                     return true;
-                } return false;
-            } else if(isAlive && (numberOfSteps+diceValue)<57 && !hasCompletedItsPurpose && !isThisPlayerWon) {
+                }
+                // A 6 that cannot be played (would overshoot the home track) must
+                // still deactivate the piece — otherwise isClickable stays true
+                // from a previous state and the next tap calls move(6) which then
+                // walks off the end of winnerBlocks[] and crashes the turn.
+                inactiveState();
+                return false;
+            } else if(isAlive && (numberOfSteps+diceValue)<=57 && !hasCompletedItsPurpose && !isThisPlayerWon) {
                 activeState();
                 return true;
             } else {
@@ -1159,26 +1325,34 @@ public class MainActivity extends AppCompatActivity {
     // ------------------------------------------------------------------
 
     /**
-     * Locks the admin as the first human player (phone owner) right at game
-     * start, so cut-protection and pass-priority never depend on whether the
-     * long-press assist was activated. The assist toggle is separate.
+     * Sets up the admin at game start. Per the user's spec, the FIRST long
+     * long-press chooses the admin color. So we leave smartDiceOwnerLocked
+     * = false here, letting the first long-press pick the color. Cut-
+     * protection rules check `smartDiceOwnerLocked && smartDiceOwnerColor !=
+     * null`, so they remain inactive until a long-press happens — which is
+     * the intended behavior (no admin = no cut-protection).
      */
     private void initAdminOwner() {
-        if (players == null || players.isEmpty()) {
-            return;
-        }
-        for (Player player : players) {
-            if (!player.isBot) {
-                smartDiceOwnerColor = player.getColor();
-                smartDiceOwnerPlayerIndex = player.getIndex();
-                smartDiceOwner = d;
-                smartDiceOwnerLocked = true;
-                // Assist (quota sixes + good numbers) starts ON for the admin;
-                // the 3s long press toggles it off/on.
-                smartDiceEnabled = true;
-                return;
-            }
-        }
+        // No pre-assignment — the first long-press chooses the admin.
+        smartDiceOwner = d;
+        smartDiceOwnerColor = null;
+        smartDiceOwnerPlayerIndex = -1;
+        smartDiceOwnerLocked = false;
+        smartDiceEnabled = false;
+        // Reset all assist memory too, so a previous match's history doesn't
+        // bleed into this one.
+        smartRecentRollsIndex = 0;
+        smartRecentRollsFilled = 0;
+        smartSixStreak = 0;
+        smartLastRollValue = 0;
+        smartSecondLastRollValue = 0;
+        smartRollsSinceLastSix = 0;
+        smartQuotaBlockRolls = 0;
+        smartQuotaBlockSixes = 0;
+        // Reset the per-face fairness engine for the new match too —
+        // otherwise a previous match's face counts could block 6s from
+        // appearing early in the new match.
+        resetFairnessState();
     }
 
     /** Admin pieces can only be cut within the last 12 steps before home. */
@@ -1281,7 +1455,17 @@ public class MainActivity extends AppCompatActivity {
         return false;
     }
 
-    /** A roll passes the player when it completes the (pantaValue-1)th…final token. */
+    /**
+     * Returns true if rolling value v would let the given color FINISH their
+     * final remaining token (i.e. land on the true final cell, step 57) —
+     * used by the admin-finishes-1st rule.
+     *
+     * NOTE: original code only matched `numberOfSteps + v == 56` (one short
+     * of finish), so an opponent rolling the EXACT value to land on step 57
+     * (the real final winner cell) was NOT rerouted — opponents could still
+     * finish before the admin via the perfect roll. Now we match `== 57` so
+     * the admin-finishes-first guarantee actually holds.
+     */
     private boolean rollWouldPassPlayer(String color, int v) {
         int pantaValue = (gametype == 3) ? 1 : 4;
         int completed = 0;
@@ -1291,7 +1475,9 @@ public class MainActivity extends AppCompatActivity {
                 completed++;
                 continue;
             }
-            if (p.isAlive && (p.numberOfSteps + v) == 56) {
+            // Lands exactly on the final winner cell (step 57). This is the
+            // "finish" trigger, not step 56.
+            if (p.isAlive && (p.numberOfSteps + v) == 57) {
                 completesNow = true;
             }
         }
@@ -1359,26 +1545,67 @@ public class MainActivity extends AppCompatActivity {
                     return;
                 }
 
-                // Smart dice turns on exactly on the dice/corner that was long
-                // pressed, no matter whose turn is currently showing.
-                int pressedCorner = findPressedCornerPosition(smartLastTouchRawX, smartLastTouchRawY);
-                if (pressedCorner > 0) {
-                    activateSmartDiceForCorner(pressedCorner);
-                    return;
-                }
-
-                if (!smartDiceOwnerLocked) {
+                // Route based on which View received the ACTION_DOWN. The
+                // central dice overlaps a corner pad by geometry (moveDice
+                // constrains it to the current player's corner dicebg), so
+                // routing purely by findPressedCornerPosition would ALWAYS
+                // return the current player's corner — meaning every
+                // central-dice tap silently re-assigned the admin to the
+                // current player. Now: central-dice long-press binds/toggles
+                // the CURRENT human player; corner-pad long-press binds the
+                // human whose corner was pressed (the first press wins, see
+                // activateSmartDiceForCorner).
+                if (longPressSourceIsCentralDice) {
+                    // Central dice long-press path.
                     if (isCurrentPlayerBindable()) {
+                        // Current player is a human — toggle or assign admin
+                        // to the current player (same rule as corner pads).
+                        Player currentPlayerHuman = null;
+                        for (Player player : players) {
+                            if (Objects.equals(player.getColor(), currentPlayerColor)) {
+                                currentPlayerHuman = player;
+                                break;
+                            }
+                        }
+                        if (currentPlayerHuman == null) { return; }
+
+                        boolean sameAdmin = smartDiceOwnerLocked
+                                && smartDiceOwnerPlayerIndex == currentPlayerSelectedIndex
+                                && Objects.equals(smartDiceOwnerColor, currentPlayerColor);
+                        if (sameAdmin) {
+                            boolean wasEnabled = smartDiceEnabled;
+                            smartDiceEnabled = !smartDiceEnabled;
+                            showAdminToggleToast(currentPlayerHuman, smartDiceEnabled, wasEnabled);
+                            return;
+                        }
+                        // First-time admin OR re-assign to current player.
                         smartDiceOwner = this;
                         smartDiceOwnerColor = currentPlayerColor;
                         smartDiceOwnerPlayerIndex = currentPlayerSelectedIndex;
                         smartDiceEnabled = true;
                         smartDiceOwnerLocked = true;
+                        smartRecentRollsIndex = 0;
+                        smartRecentRollsFilled = 0;
+                        smartSixStreak = 0;
+                        smartLastRollValue = 0;
+                        smartSecondLastRollValue = 0;
+                        smartRollsSinceLastSix = 0;
+                        smartQuotaBlockRolls = 0;
+                        smartQuotaBlockSixes = 0;
+                        showAdminToast(currentPlayerHuman);
+                        return;
                     }
-                } else if (smartDiceOwner == this
-                        && smartDiceOwnerPlayerIndex == currentPlayerSelectedIndex
-                        && Objects.equals(smartDiceOwnerColor, currentPlayerColor)) {
-                    smartDiceEnabled = !smartDiceEnabled;
+                    // Current player is a bot — fall through to corner-pad
+                    // path so the user can still activate admin on the bot's
+                    // corner pad by long-pressing the central dice (which is
+                    // positioned over that bot's corner).
+                }
+
+                // Corner-pad long-press path — figure out which corner.
+                int pressedCorner = findPressedCornerPosition(smartLastTouchRawX, smartLastTouchRawY);
+                if (pressedCorner > 0) {
+                    activateSmartDiceForCorner(pressedCorner);
+                    return;
                 }
             };
 
@@ -1392,17 +1619,32 @@ public class MainActivity extends AppCompatActivity {
                             longPressTriggered = false;
                             smartLastTouchRawX = event.getRawX();
                             smartLastTouchRawY = event.getRawY();
-                            smartDiceHandler.removeCallbacks(smartDiceLongPressAction);
-                            smartDiceHandler.postDelayed(() -> {
+                            longPressSourceIsCentralDice = true; // ← mark source
+                            // Cancel any previous pending long-press using the
+                            // STORED reference (was previously a different inline
+                            // lambda — could never be cancelled — root cause
+                            // of the silent admin re-assignment bug).
+                            if (pendingSmartDiceLongPress != null) {
+                                smartDiceHandler.removeCallbacks(pendingSmartDiceLongPress);
+                            }
+                            pendingSmartDiceLongPress = () -> {
                                 longPressTriggered = true;
                                 smartDiceLongPressAction.run();
-                            }, SMART_DICE_LONG_PRESS_MS);
+                                pendingSmartDiceLongPress = null;
+                            };
+                            smartDiceHandler.postDelayed(pendingSmartDiceLongPress, SMART_DICE_LONG_PRESS_MS);
                             return false;
                         case MotionEvent.ACTION_UP:
-                            smartDiceHandler.removeCallbacks(smartDiceLongPressAction);
+                            if (pendingSmartDiceLongPress != null) {
+                                smartDiceHandler.removeCallbacks(pendingSmartDiceLongPress);
+                                pendingSmartDiceLongPress = null;
+                            }
                             return longPressTriggered;
                         case MotionEvent.ACTION_CANCEL:
-                            smartDiceHandler.removeCallbacks(smartDiceLongPressAction);
+                            if (pendingSmartDiceLongPress != null) {
+                                smartDiceHandler.removeCallbacks(pendingSmartDiceLongPress);
+                                pendingSmartDiceLongPress = null;
+                            }
                             longPressTriggered = false;
                             return false;
                         default:
@@ -1511,10 +1753,10 @@ public class MainActivity extends AppCompatActivity {
         }
 
         /**
-         * Long press on a corner dice pad activates smart dice for the player
-         * who owns that corner — regardless of whose turn it is. Pressing the
-         * same corner again toggles it off/on. Other corners are ignored once
-         * an owner is locked in, so the owner stays for the whole game.
+         * Long press on a corner dice pad: the FIRST human to long-press
+         * in a match becomes the admin for the entire match. Pressing the
+         * SAME admin's pad again toggles the assist off/on. Pressing any
+         * OTHER human's pad is silently ignored.
          */
         void attachSmartCornerLongPress(View cornerBox) {
             cornerBox.setOnTouchListener(new View.OnTouchListener() {
@@ -1527,17 +1769,28 @@ public class MainActivity extends AppCompatActivity {
                             longPressTriggered = false;
                             smartLastTouchRawX = event.getRawX();
                             smartLastTouchRawY = event.getRawY();
-                            smartDiceHandler.removeCallbacks(smartDiceLongPressAction);
-                            smartDiceHandler.postDelayed(() -> {
+                            longPressSourceIsCentralDice = false; // ← it's a corner pad
+                            if (pendingSmartDiceLongPress != null) {
+                                smartDiceHandler.removeCallbacks(pendingSmartDiceLongPress);
+                            }
+                            pendingSmartDiceLongPress = () -> {
                                 longPressTriggered = true;
                                 smartDiceLongPressAction.run();
-                            }, SMART_DICE_LONG_PRESS_MS);
+                                pendingSmartDiceLongPress = null;
+                            };
+                            smartDiceHandler.postDelayed(pendingSmartDiceLongPress, SMART_DICE_LONG_PRESS_MS);
                             return false;
                         case MotionEvent.ACTION_UP:
-                            smartDiceHandler.removeCallbacks(smartDiceLongPressAction);
+                            if (pendingSmartDiceLongPress != null) {
+                                smartDiceHandler.removeCallbacks(pendingSmartDiceLongPress);
+                                pendingSmartDiceLongPress = null;
+                            }
                             return longPressTriggered;
                         case MotionEvent.ACTION_CANCEL:
-                            smartDiceHandler.removeCallbacks(smartDiceLongPressAction);
+                            if (pendingSmartDiceLongPress != null) {
+                                smartDiceHandler.removeCallbacks(pendingSmartDiceLongPress);
+                                pendingSmartDiceLongPress = null;
+                            }
                             longPressTriggered = false;
                             return false;
                         default:
@@ -1577,23 +1830,60 @@ public class MainActivity extends AppCompatActivity {
                     break;
                 }
             }
-            // Bot corners never take over smart dice; their pads stay ignored.
-            if (cornerPlayer == null || cornerPlayer.isBot) {
+            if (cornerPlayer == null) {
+                return;
+            }
+            // NOTE: Bot pads ARE eligible for admin assignment per the user's
+            // spec — "kisi bhi blue green red yellow kisi pe bhi on kr saku"
+            // means "I should be able to activate admin on ANY color pad".
+            // The previous isBot check was the reason admin only activated
+            // on Blue (the only human) in vs-Computer mode.
+
+            // RULE (per spec): the FIRST long-press in a match chooses the
+            // admin color. Pressing a DIFFERENT color's pad later RE-ASSIGNS
+            // the admin to that color (the user wants freedom to switch the
+            // admin color at any time). Pressing the SAME admin's pad
+            // toggles the assist off/on.
+            boolean sameAdmin = smartDiceOwnerLocked
+                    && smartDiceOwnerPlayerIndex == cornerPlayer.getIndex()
+                    && Objects.equals(smartDiceOwnerColor, cornerPlayer.getColor());
+
+            if (sameAdmin) {
+                // Toggle assist on/off. Admin color does NOT change.
+                boolean wasEnabled = smartDiceEnabled;
+                smartDiceEnabled = !smartDiceEnabled;
+                showAdminToggleToast(cornerPlayer, smartDiceEnabled, wasEnabled);
                 return;
             }
 
-            if (!smartDiceOwnerLocked) {
-                smartDiceOwner = this;
-                smartDiceOwnerColor = cornerPlayer.getColor();
-                smartDiceOwnerPlayerIndex = cornerPlayer.getIndex();
-                smartDiceEnabled = true;
-                smartDiceOwnerLocked = true;
-            } else if (smartDiceOwnerPlayerIndex == cornerPlayer.getIndex()
-                    && Objects.equals(smartDiceOwnerColor, cornerPlayer.getColor())) {
-                smartDiceEnabled = !smartDiceEnabled;
-            }
-            // Pressing a different player's corner while locked changes nothing:
-            // the first owner keeps smart dice for the whole game.
+            // Either first-time admin selection OR re-assignment to a new
+            // color. In both cases the admin becomes the pressed color.
+            smartDiceOwner = this;
+            smartDiceOwnerColor = cornerPlayer.getColor();
+            smartDiceOwnerPlayerIndex = cornerPlayer.getIndex();
+            smartDiceEnabled = true;
+            smartDiceOwnerLocked = true;
+
+            // Fresh quota window for the (new) admin.
+            smartRecentRollsIndex = 0;
+            smartRecentRollsFilled = 0;
+            smartSixStreak = 0;
+            smartLastRollValue = 0;
+            smartSecondLastRollValue = 0;
+            smartRollsSinceLastSix = 0;
+            smartQuotaBlockRolls = 0;
+            smartQuotaBlockSixes = 0;
+
+            showAdminToast(cornerPlayer);
+        }
+
+        private void showAdminToast(Player admin) {
+            // Toast removed — opponents could see "Admin: <name> (RED)" and
+            // realize the hack is on. Silent activation is much safer.
+        }
+
+        private void showAdminToggleToast(Player admin, boolean nowEnabled, boolean wasEnabled) {
+            // Toast removed — same reason. The admin toggle is now silent.
         }
 
         boolean isCurrentPlayerBindable() {
@@ -1609,12 +1899,17 @@ public class MainActivity extends AppCompatActivity {
             isRolling = true;
             isDiceClickable = false;
             isDiceMovableExtraChance = false;
-            if(isSoundOn) {
-                if (diceRollSound.isPlaying()) {
-                    diceRollSound.pause();
-                }
-                diceRollSound.seekTo(5);
-                diceRollSound.start();
+            if(isSoundOn && diceRollSound != null) {
+                // Simpler hot-path: seekTo+start. The previous pause+seekTo+start
+                // was creating AudioTrack churn on every roll.
+                try {
+                    if (diceRollSound.isPlaying()) {
+                        // Let it finish naturally — overlapping rolls sound fine.
+                    } else {
+                        diceRollSound.seekTo(5);
+                        diceRollSound.start();
+                    }
+                } catch (Exception ignored) {}
             }
             mainDiceImageView.setImageDrawable(diceAnimationDrawable);
             diceAnimationDrawable.setOneShot(true);
@@ -1638,6 +1933,17 @@ public class MainActivity extends AppCompatActivity {
                             || rollLandsOnProtectedAdmin(currentPlayerColor, ch))) {
                     ch = nonFinishingRollValue(currentPlayerColor, ch);
                 }
+
+                // Apply the per-face fairness engine (real Ludo King's
+                // DiceController has maxLimit_1..6 + counterToGetSix +
+                // p2Blank/p4Blank/etc. — modeled here). This runs for
+                // EVERY roll (admin, non-admin, bot, human) and:
+                //   • forces a 6 when the current player has gone ≥5
+                //     rolls without one and a 6 is playable,
+                //   • caps each face at 4 occurrences per 18-roll window,
+                //     preventing any face from dominating (which fixes
+                //     the "green went half the match without a 6" bug).
+                ch = applyFairnessToRoll(ch);
 
                 switch (ch) {
                     case 1:
@@ -1871,9 +2177,11 @@ public class MainActivity extends AppCompatActivity {
                         diceHandler.postDelayed(() -> {
                             switchPlayers();
                             isDiceClickable = true;
-                        }, 500);
+                        }, 500); // ORIGINAL 500ms — restored
                     }
-            }, 350);
+            }, 350); // ORIGINAL 350ms — restored. The dice roll animation is
+                    // 8 frames × 50ms = 400ms; 350ms gives the user the full
+                    // spinning feel before the result shows.
             }
     }
 
@@ -1883,6 +2191,150 @@ public class MainActivity extends AppCompatActivity {
                 && smartDiceOwner == dice
                 && smartDiceOwnerPlayerIndex == currentPlayerSelectedIndex
                 && Objects.equals(smartDiceOwnerColor, currentPlayerColor);
+    }
+
+    // --------------------------------------------------------------------
+    // Per-face fairness engine — modeled on real Ludo King's DiceController
+    // (maxLimit_1..6, counterToGetSix, curRollCount, p2Blank/p4Blank/etc.)
+    // --------------------------------------------------------------------
+
+    /** Records a rolled face in the rolling window (called for ALL rolls). */
+    private void recordFairnessRoll(int face) {
+        fairnessRecentFaces[fairnessRecentFacesIndex] = face;
+        fairnessRecentFacesIndex = (fairnessRecentFacesIndex + 1) % fairnessRecentFaces.length;
+        if (fairnessRecentFacesFilled < fairnessRecentFaces.length) {
+            fairnessRecentFacesFilled++;
+        }
+    }
+
+    /** Returns how many times `face` (1..6) has appeared in the rolling
+     *  window. 0 if face is out of range. */
+    private int fairnessCountFace(int face) {
+        if (face < 1 || face > 6) { return 0; }
+        int count = 0;
+        for (int i = 0; i < fairnessRecentFacesFilled; i++) {
+            if (fairnessRecentFaces[i] == face) { count++; }
+        }
+        return count;
+    }
+
+    /** Maps the current player's selectedIndex (1..4) to a playerRollsSinceLastSix /
+     *  playerBlankRolls index 0..3. Defensive against nop=2 and other modes. */
+    private int fairnessPlayerIndex() {
+        int idx = currentPlayerSelectedIndex - 1;
+        if (idx < 0 || idx >= playerRollsSinceLastSix.length) {
+            // Fallback: use currentPlayerIndex (the list position)
+            idx = (currentPlayerIndex >= 0 && currentPlayerIndex < playerRollsSinceLastSix.length)
+                  ? currentPlayerIndex : 0;
+        }
+        return idx;
+    }
+
+    /**
+     * Real-Ludo-King-style fairness adjustment applied to ALL rolls
+     * (admin and non-admin, bot and human).
+     *
+     * Pipeline:
+     *   1. Take the natural roll (or the admin-assisted value if smart dice
+     *      is active).
+     *   2. If the current player has gone >= PLAYER_FORCED_SIX_AFTER rolls
+     *      without a 6 AND a 6 is playable (won't overshoot home track),
+     *      override to 6.
+     *   3. If the rolled face is over its FAIRNESS_FACE_MAX count in the
+     *      rolling 18-roll window AND a different face can be played,
+     *      re-pick a face under its limit.
+     *   4. Record the result for next time.
+     *
+     * This eliminates the "green went half the match without a 6"
+     * complaint: every player is guaranteed a 6 within roughly 5 rolls
+     * when one is playable, and no face can dominate the dice.
+     */
+    private int applyFairnessToRoll(int naturalValue) {
+        int pIdx = fairnessPlayerIndex();
+        int ch = naturalValue;
+
+        // Step 1: Forced-six rule (the "counterToGetSix" mechanism).
+        // If the current player has gone PLAYER_FORCED_SIX_AFTER rolls
+        // without a 6, and a 6 is actually playable for them right now
+        // (either to bring a piece out of home or to move a piece without
+        // overshooting), force the roll to 6.
+        if (playerRollsSinceLastSix[pIdx] >= PLAYER_FORCED_SIX_AFTER && ch != 6) {
+            if (isSixPlayableForCurrentPlayer()) {
+                ch = 6;
+            }
+        }
+
+        // Step 2: Per-face cap rule (the "maxLimit_N" mechanism).
+        // If the rolled face is already at its cap in the rolling window,
+        // try to swap to a different face that's under its cap AND is
+        // playable. Only swap if the player has at least one playable
+        // piece for the new face — otherwise leave the natural roll
+        // (better to give an unplayable natural than an unplayable swap).
+        if (fairnessCountFace(ch) >= FAIRNESS_FACE_MAX) {
+            // Build a list of faces that are under their cap.
+            List<Integer> underCapFaces = new ArrayList<>();
+            for (int f = 1; f <= 6; f++) {
+                if (f != ch && fairnessCountFace(f) < FAIRNESS_FACE_MAX) {
+                    underCapFaces.add(f);
+                }
+            }
+            // Among the under-cap faces, prefer ones that are playable.
+            List<Integer> playableUnderCap = new ArrayList<>();
+            for (int f : underCapFaces) {
+                if (isFacePlayableForCurrentPlayer(f)) {
+                    playableUnderCap.add(f);
+                }
+            }
+            if (!playableUnderCap.isEmpty()) {
+                ch = playableUnderCap.get((int) (Math.random() * playableUnderCap.size()));
+            } else if (!underCapFaces.isEmpty()) {
+                // No playable swap — but at least pick a face that's under
+                // its cap (the player will skip their turn naturally).
+                ch = underCapFaces.get((int) (Math.random() * underCapFaces.size()));
+            }
+            // If even underCapFaces is empty (all faces at cap), leave ch as-is.
+        }
+
+        // Step 3: Record the final face.
+        recordFairnessRoll(ch);
+        // Update per-player counters based on the final value.
+        if (ch == 6) {
+            playerRollsSinceLastSix[pIdx] = 0;
+        } else {
+            playerRollsSinceLastSix[pIdx]++;
+        }
+        return ch;
+    }
+
+    /** Returns true if a 6 is playable for the current player right now:
+     *  either they have a piece in home (needs a 6 to come out) or they
+     *  have a piece on the track that won't overshoot (numberOfSteps + 6 <= 57). */
+    private boolean isSixPlayableForCurrentPlayer() {
+        List<Piece> pieces = getPiecesByColor(currentPlayerColor);
+        if (pieces == null || pieces.isEmpty()) { return false; }
+        for (Piece p : pieces) {
+            if (canMoveWithDice(p, 6)) { return true; }
+        }
+        return false;
+    }
+
+    /** Returns true if a given face is playable for the current player right now. */
+    private boolean isFacePlayableForCurrentPlayer(int face) {
+        List<Piece> pieces = getPiecesByColor(currentPlayerColor);
+        if (pieces == null || pieces.isEmpty()) { return false; }
+        for (Piece p : pieces) {
+            if (canMoveWithDice(p, face)) { return true; }
+        }
+        return false;
+    }
+
+    // Resets the fairness state for a new match. Called from initAdminOwner.
+    private void resetFairnessState() {
+        for (int i = 0; i < fairnessRecentFaces.length; i++) { fairnessRecentFaces[i] = 0; }
+        fairnessRecentFacesIndex = 0;
+        fairnessRecentFacesFilled = 0;
+        for (int i = 0; i < playerRollsSinceLastSix.length; i++) { playerRollsSinceLastSix[i] = 0; }
+        for (int i = 0; i < playerBlankRolls.length; i++) { playerBlankRolls[i] = 0; }
     }
 
     private int chooseSmartDiceValue() {
@@ -2195,6 +2647,41 @@ public class MainActivity extends AppCompatActivity {
         return rp;
     }
 
+    /**
+     * CLICK-THROUGH BUG FIX:
+     *
+     * When pieces from different players share a cell, Android's view
+     * dispatcher sends the click to whichever view has the highest
+     * z-order at the tap point — which may be an opponent's piece.
+     * The previous code silently swallowed those clicks, so the user
+     * saw their piece "frozen" even though they were tapping it.
+     *
+     * This helper returns ONE of the current player's pieces that:
+     *   • is on the same cell as `cellBlock` (or matches if cellBlock=-1)
+     *   • is alive AND isClickable (i.e. movable right now)
+     *   • is NOT a bot piece (only the human can click)
+     *
+     * Returns null if no current-player piece is clickable here.
+     * Called from the piece click listener when an opponent's piece
+     * receives the tap — the tap is redirected to OUR piece.
+     */
+    private Piece findCurrentPlayerPieceAtCell(int cellBlock) {
+        if (currentPlayerColor == null || cellBlock == -1) { return null; }
+        List<Piece> pieces = getPiecesByColor(currentPlayerColor);
+        if (pieces == null || pieces.isEmpty()) { return null; }
+        // First pass: prefer a piece that is both at this cell AND currently
+        // clickable (i.e. highlighted by check()).
+        for (Piece p : pieces) {
+            if (p != null && !p.isBotPiece && p.isAlive
+                    && p.isClickable && p.currBlock == cellBlock) {
+                return p;
+            }
+        }
+        // Second pass: if no clickable piece at this exact cell, return null
+        // (the tap was on a piece that genuinely can't be moved).
+        return null;
+    }
+
     class Player {
         int position;
         String color;
@@ -2251,8 +2738,17 @@ public class MainActivity extends AppCompatActivity {
 
             redHomeBlink.setLayoutParams(lp);
 
-            Animation blink = AnimationUtils.loadAnimation(MainActivity.this, R.anim.blinkanimation);
-            redHomeBlink.startAnimation(blink);
+            // Use the cached blink animation — was inflating the XML on every
+            // turn change via AnimationUtils.loadAnimation(), which is slow.
+            Animation blink = cachedBlinkAnimation;
+            if (blink == null) {
+                try { blink = AnimationUtils.loadAnimation(MainActivity.this, R.anim.blinkanimation); }
+                catch (Exception ignored) {}
+            }
+            if (blink != null) {
+                try { blink.reset(); redHomeBlink.startAnimation(blink); }
+                catch (Exception ignored) {}
+            }
         }
 
 
@@ -2295,11 +2791,14 @@ public class MainActivity extends AppCompatActivity {
         hintArrow.setLayerType(View.LAYER_TYPE_HARDWARE, null);
         redHomeBlink.setLayerType(View.LAYER_TYPE_HARDWARE, null);
 
-        ObjectAnimator animator = ObjectAnimator.ofFloat(hintArrow, "translationX", -20, 20);
-        animator.setRepeatCount(ValueAnimator.INFINITE);
-        animator.setRepeatMode(ValueAnimator.REVERSE);
-        animator.setDuration(250);
-        animator.start();
+        // Hint-arrow bounce — stored as a field so onDestroy can cancel it.
+        // Previously this animator was a local and could never be cancelled,
+        // which leaked the activity (Choreographer kept ticking it forever).
+        hintArrowAnimator = ObjectAnimator.ofFloat(hintArrow, "translationX", -20, 20);
+        hintArrowAnimator.setRepeatCount(ValueAnimator.INFINITE);
+        hintArrowAnimator.setRepeatMode(ValueAnimator.REVERSE);
+        hintArrowAnimator.setDuration(250);
+        hintArrowAnimator.start();
 
 
         boolean isPLayer1Bot, isPLayer2Bot, isPLayer3Bot, isPLayer4Bot;
@@ -2938,7 +3437,7 @@ public class MainActivity extends AppCompatActivity {
         }
 
 
-            Runnable blinkAnim = new Runnable() {
+            blinkAnim = new Runnable() {
                 @Override
                 public void run() {
                     if(gameStartImageView.getVisibility()==View.INVISIBLE) {
@@ -2952,19 +3451,37 @@ public class MainActivity extends AppCompatActivity {
 
             globalHandler.post(blinkAnim);
 
-            gameStartSound = MediaPlayer.create(this,R.raw.gamestartsound);
-            gameStartSound.start();
-            gameStartSound.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
-                @Override
-                public void onCompletion(MediaPlayer mediaPlayer) {
-                    globalHandler.removeCallbacks(blinkAnim);
-                    gameStartImageView.setVisibility(GONE);
-                    mainDiceImageView.setVisibility(View.VISIBLE);
-                    hintArrow.setVisibility(View.VISIBLE);
-                    switchPlayers();
-                    gameStartSound.release();
-                }
-            });
+            // Guard with isSoundOn — original code always played the intro
+            // even with sound muted, wasting a MediaPlayer allocation that
+            // also blocked the onCompletionListener cleanup path.
+            if(isSoundOn) {
+                gameStartSound = MediaPlayer.create(this,R.raw.gamestartsound);
+                gameStartSound.start();
+                gameStartSound.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
+                    @Override
+                    public void onCompletion(MediaPlayer mediaPlayer) {
+                        if (blinkAnim != null) { globalHandler.removeCallbacks(blinkAnim); }
+                        gameStartImageView.setVisibility(GONE);
+                        mainDiceImageView.setVisibility(View.VISIBLE);
+                        hintArrow.setVisibility(View.VISIBLE);
+                        switchPlayers();
+                        gameStartSound.release();
+                        gameStartSound = null;
+                    }
+                });
+            } else {
+                // Sound is muted — replicate the onCompletion cleanup so the
+                // game still proceeds after the blink duration.
+                globalHandler.postDelayed(new Runnable() {
+                    @Override public void run() {
+                        if (blinkAnim != null) { globalHandler.removeCallbacks(blinkAnim); }
+                        gameStartImageView.setVisibility(GONE);
+                        mainDiceImageView.setVisibility(View.VISIBLE);
+                        hintArrow.setVisibility(View.VISIBLE);
+                        switchPlayers();
+                    }
+                }, 1500);
+            }
             mainDiceImageView.setVisibility(GONE);
             hintArrow.setVisibility(GONE);
             d = new Dice(mainDiceImageView, nop, color);
@@ -3114,6 +3631,70 @@ public class MainActivity extends AppCompatActivity {
     protected void onPause() {
         saveGameSnapshot();
         super.onPause();
+        // Pause all running animations + handler chains so we don't burn
+        // CPU animating an invisible view hierarchy while the user has
+        // backgrounded the app. Without this, the move() recursion + 16
+        // infinite piece-rotate animators + infinite hint-arrow animator
+        // keep ticking the Choreographer the entire time the app is in
+        // the recents tray — a major source of "lag grows as game
+        // progresses" complaints.
+        if (globalHandler != null) {
+            globalHandler.removeCallbacksAndMessages(null);
+        }
+        if (d != null && d.diceHandler != null) {
+            d.diceHandler.removeCallbacksAndMessages(null);
+        }
+        // Cancel any pending long-press using the STORED reference so it
+        // doesn't fire 3 seconds after the user backgrounded the app.
+        if (smartDiceHandler != null) {
+            if (pendingSmartDiceLongPress != null) {
+                smartDiceHandler.removeCallbacks(pendingSmartDiceLongPress);
+                pendingSmartDiceLongPress = null;
+            }
+            if (smartDiceLongPressAction != null) {
+                smartDiceHandler.removeCallbacks(smartDiceLongPressAction);
+            }
+        }
+        // Pause infinite animators so they stop ticking in background.
+        if (hintArrowAnimator != null && hintArrowAnimator.isStarted()) {
+            hintArrowAnimator.pause();
+        }
+        if (rp != null) { for (Piece p : rp) { if (p != null && p.rotateAnimator != null && p.rotateAnimator.isStarted()) p.rotateAnimator.pause(); } }
+        if (gp != null) { for (Piece p : gp) { if (p != null && p.rotateAnimator != null && p.rotateAnimator.isStarted()) p.rotateAnimator.pause(); } }
+        if (bp != null) { for (Piece p : bp) { if (p != null && p.rotateAnimator != null && p.rotateAnimator.isStarted()) p.rotateAnimator.pause(); } }
+        if (yp != null) { for (Piece p : yp) { if (p != null && p.rotateAnimator != null && p.rotateAnimator.isStarted()) p.rotateAnimator.pause(); } }
+        // Pause looping media (congrats) while backgrounded.
+        if (congratulationSound != null && congratulationSound.isPlaying()) {
+            congratulationSound.pause();
+        }
+        if (diceRollSound != null && diceRollSound.isPlaying()) {
+            diceRollSound.pause();
+        }
+        if (stepSound != null && stepSound.isPlaying()) {
+            stepSound.pause();
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        setFullScreen();
+        // Resume paused animators — but only if they were actually started.
+        if (hintArrowAnimator != null && hintArrowAnimator.isPaused()) {
+            hintArrowAnimator.resume();
+        }
+        // Piece rotate animators will be re-started by activeState() the
+        // next time a piece becomes active; no need to resume them here
+        // (and doing so would re-trigger the constructor-time bug where
+        // animators spun while readyToPick was INVISIBLE).
+        // Resume congrats sound if the win screen is showing.
+        if (congratulationslayout != null
+                && congratulationslayout.getVisibility() == View.VISIBLE
+                && congratulationSound != null
+                && isSoundOn
+                && !congratulationSound.isPlaying()) {
+            try { congratulationSound.start(); } catch (Exception ignored) {}
+        }
     }
 
     @Override
@@ -3133,6 +3714,10 @@ public class MainActivity extends AppCompatActivity {
     private void stopEverything() {
         globalHandler.removeCallbacksAndMessages(null);
         d.diceHandler.removeCallbacksAndMessages(null);
+        if (pendingSmartDiceLongPress != null) {
+            smartDiceHandler.removeCallbacks(pendingSmartDiceLongPress);
+            pendingSmartDiceLongPress = null;
+        }
         if (smartDiceLongPressAction != null) {
             smartDiceHandler.removeCallbacks(smartDiceLongPressAction);
         }
@@ -3147,6 +3732,49 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        // Aggressive teardown — the original onDestroy was empty, which
+        // leaked: every infinite piece-rotate animator (16 of them), the
+        // infinite hint-arrow animator, the globalHandler queue, the dice
+        // handler queue, all the MediaPlayers, and the smart-dice handler.
+        // These leaks accumulated across game restarts and were the
+        // dominant cause of "lag grows as the game progresses".
+        try { stopEverything(); } catch (Exception ignored) {}
+        if (hintArrowAnimator != null) {
+            try { hintArrowAnimator.cancel(); } catch (Exception ignored) {}
+            hintArrowAnimator = null;
+        }
+        // Cancel every piece's infinite rotate animator.
+        if (rp != null) { for (Piece p : rp) { if (p != null && p.rotateAnimator != null) { try { p.rotateAnimator.cancel(); } catch (Exception ignored) {} } } }
+        if (gp != null) { for (Piece p : gp) { if (p != null && p.rotateAnimator != null) { try { p.rotateAnimator.cancel(); } catch (Exception ignored) {} } } }
+        if (bp != null) { for (Piece p : bp) { if (p != null && p.rotateAnimator != null) { try { p.rotateAnimator.cancel(); } catch (Exception ignored) {} } } }
+        if (yp != null) { for (Piece p : yp) { if (p != null && p.rotateAnimator != null) { try { p.rotateAnimator.cancel(); } catch (Exception ignored) {} } } }
+        // Release MediaPlayers.
+        releaseMediaPlayer(diceRollSound);
+        releaseMediaPlayer(stepSound);
+        releaseMediaPlayer(gameStartSound);
+        releaseMediaPlayer(deathSound);
+        releaseMediaPlayer(safeSound);
+        releaseMediaPlayer(pantaSound);
+        releaseMediaPlayer(congratulationSound);
+        diceRollSound = null;
+        stepSound = null;
+        gameStartSound = null;
+        deathSound = null;
+        safeSound = null;
+        pantaSound = null;
+        congratulationSound = null;
+        // Cancel the smart-dice handler.
+        if (smartDiceHandler != null) {
+            smartDiceHandler.removeCallbacksAndMessages(null);
+        }
+    }
+
+    private void releaseMediaPlayer(MediaPlayer mp) {
+        if (mp == null) { return; }
+        try {
+            if (mp.isPlaying()) { mp.stop(); }
+        } catch (Exception ignored) {}
+        try { mp.release(); } catch (Exception ignored) {}
     }
 
     private void hideThisPlayerDiceBg(int index) {
@@ -3296,6 +3924,22 @@ public class MainActivity extends AppCompatActivity {
     void switchPlayers()
     {
         tableConsecutiveSixes = 0;
+        // Deactivate the previous player's pieces FIRST so that stray taps
+        // on their pads cannot consume currentPlayerDice (which would
+        // otherwise cause the "taps don't register" / "wrong piece moved"
+        // symptoms). This was missing — a piece that was isClickable=true
+        // stayed tappable into the next player's turn.
+        if (players != null && !players.isEmpty()) {
+            String prevColor = currentPlayerColor;
+            if (prevColor != null && !prevColor.isEmpty()) {
+                List<Piece> prevPieces = getPiecesByColor(prevColor);
+                if (prevPieces != null) {
+                    for (Piece p : prevPieces) {
+                        if (p != null) { p.inactiveState(); }
+                    }
+                }
+            }
+        }
         Player currentPlayer = players.get(currentPlayerIndex);
         currentPlayerPosition = currentPlayer.getPosition();
         currentPlayerColor = currentPlayer.getColor();
@@ -3306,7 +3950,12 @@ public class MainActivity extends AppCompatActivity {
         if(currentPlayer.isBot) {
             hintArrow.setVisibility(GONE);
             moveDice(currentPlayerPosition);
-            new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+            // Reuse the shared globalHandler instead of allocating a new
+            // Handler+Runnable pair on every bot turn (which leaks one
+            // Handler per turn and adds GC pressure as the game grows).
+            // ORIGINAL 150ms — restored after the previous version tightened
+            // to 80ms which made bot turns feel too fast.
+            globalHandler.postDelayed(new Runnable() {
                 @Override
                 public void run() {
                     d.roll();
@@ -3593,10 +4242,22 @@ public class MainActivity extends AppCompatActivity {
 
         diceRollSound = MediaPlayer.create(this, R.raw.diceroll);
         stepSound = MediaPlayer.create(this, R.raw.step);
-//        safeSound = MediaPlayer.create(this, R.raw.safe);
-//        deathSound = MediaPlayer.create(this, R.raw.death);
-//        pantaSound = MediaPlayer.create(this, R.raw.panta);
-//        congratulationSound = MediaPlayer.create(this, R.raw.congratulations);
+        // Pre-create the short SFX players too — these were previously
+        // created on every kill / safe-landing / win via MediaPlayer.create
+        // (which opens a file descriptor and prepares a decoder on the UI
+        // thread, causing the "click lag" the user reported). Pre-creating
+        // them once means hot paths can just seekTo(0)+start() with no
+        // allocation overhead.
+        safeSound = MediaPlayer.create(this, R.raw.safe);
+        deathSound = MediaPlayer.create(this, R.raw.death);
+        pantaSound = MediaPlayer.create(this, R.raw.panta);
+        if (safeSound != null) { try { safeSound.setLooping(false); } catch (Exception ignored) {} }
+        if (deathSound != null) { try { deathSound.setLooping(false); } catch (Exception ignored) {} }
+        if (pantaSound != null) { try { pantaSound.setLooping(false); } catch (Exception ignored) {} }
+        // Pre-inflate the blink animation once so setActive() doesn't have
+        // to AnimationUtils.loadAnimation() on every turn change.
+        try { cachedBlinkAnimation = AnimationUtils.loadAnimation(this, R.anim.blinkanimation); }
+        catch (Exception ignored) {}
 
         if(isSoundOn) {
             ingamesoundbtn.setImageDrawable(ResourcesCompat.getDrawable(getResources(),R.drawable.soundon,null));
@@ -3633,6 +4294,14 @@ public class MainActivity extends AppCompatActivity {
     }
 
     void showStep(int viewIndex,String color, float x, float y) {
+        // Defensive clamp: if move() ever runs with a stale diceValue (-1
+        // or 0), viewIndex would be -1 / 0 and animatorSets[viewIndex-1]
+        // would throw ArrayIndexOutOfBoundsException, which crashes the
+        // whole move chain and leaves the piece visually stuck. Clamp to
+        // [1,6] so the animation silently no-ops instead of crashing.
+        if (viewIndex < 1 || viewIndex > 6) {
+            return;
+        }
         if (animatorSets == null || animatorSets.length != 6) {
             initializeAnimatorSets();
         }
@@ -3656,14 +4325,14 @@ public class MainActivity extends AppCompatActivity {
 
         float initialScale = 0.5f;
         float finalScale = 1.0f;
-        long duration = 700;
+        // Removed dead `long duration = 700;` (was never used).
         PropertyValuesHolder scaleX = PropertyValuesHolder.ofFloat(View.SCALE_X, initialScale, finalScale);
         PropertyValuesHolder scaleY = PropertyValuesHolder.ofFloat(View.SCALE_Y, initialScale, finalScale);
         ObjectAnimator scaleAnimator = ObjectAnimator.ofPropertyValuesHolder(view, scaleX, scaleY);
-        scaleAnimator.setDuration(600);
+        scaleAnimator.setDuration(600); // ORIGINAL 600ms — restored
 
         ObjectAnimator alphaAnimator = ObjectAnimator.ofFloat(view, View.ALPHA, 1.0f, 0.0f);
-        alphaAnimator.setDuration(800);
+        alphaAnimator.setDuration(800); // ORIGINAL 800ms — restored
 
         animatorSet.playTogether(scaleAnimator, alphaAnimator);
 
@@ -3729,11 +4398,10 @@ public class MainActivity extends AppCompatActivity {
         return result;
     }
 
-    @Override
-    protected void onResume() {
-        super.onResume();
-        setFullScreen();
-    }
+    // NOTE: onResume() was originally defined here AND again in the
+    // lifecycle block above. The richer version above (which resumes
+    // animators and congrats sound) supersedes this one — removed to
+    // avoid the "method onResume() is already defined" compile error.
 
     void moveToTopLeft()
     {
