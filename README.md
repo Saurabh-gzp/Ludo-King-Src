@@ -102,3 +102,12 @@ cd ludo_src
 - **Stacked-token tap fix:** tap actions on stacked tokens are bound to every visible child of the token view, so moves register reliably even when one token overlaps another.
 
 
+
+## 🎯 Update — v8.0.0.286 (versionCode 1570)
+
+**Admin colour selection fix (long press works on ANY dice pad):**
+
+- Earlier the admin (smart-dice owner) was locked to the first human player (phone owner) for the whole game — long-pressing red/green/yellow pads did nothing, so it always *looked* like blue was the admin. Fixed.
+- **Now the colour you long-press becomes the admin:** press the yellow dice pad for 3 seconds and Yellow becomes the smart-dice admin (six-quota, cut-protection in the last-12 window, admin-first rule) — same for red, green, blue or any corner, human or bot, at any moment in the game. A toast shows which colour is now admin.
+- Long-pressing the **same** pad again toggles that admin's dice-assist OFF/ON (the protection rules stay on for the current admin).
+- Pressing the central dice during a human player's turn also makes that player the admin.

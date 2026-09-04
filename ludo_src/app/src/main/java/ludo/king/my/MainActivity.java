@@ -1159,9 +1159,11 @@ public class MainActivity extends AppCompatActivity {
     // ------------------------------------------------------------------
 
     /**
-     * Locks the admin as the first human player (phone owner) right at game
-     * start, so cut-protection and pass-priority never depend on whether the
-     * long-press assist was activated. The assist toggle is separate.
+     * Default smart-dice admin is the first human player (phone owner),
+     * locked in right at game start so cut-protection and pass-priority are
+     * always on. Long-pressing ANY player's dice pad switches the admin to
+     * that colour at any moment (a toast confirms it); long-pressing the
+     * same pad again toggles the dice-assist off/on.
      */
     private void initAdminOwner() {
         if (players == null || players.isEmpty()) {
@@ -1173,12 +1175,33 @@ public class MainActivity extends AppCompatActivity {
                 smartDiceOwnerPlayerIndex = player.getIndex();
                 smartDiceOwner = d;
                 smartDiceOwnerLocked = true;
-                // Assist (quota sixes + good numbers) starts ON for the admin;
-                // the 3s long press toggles it off/on.
                 smartDiceEnabled = true;
                 return;
             }
         }
+    }
+
+    private Player findPlayerByColor(String color) {
+        if (players == null || color == null) {
+            return null;
+        }
+        for (Player player : players) {
+            if (Objects.equals(player.getColor(), color)) {
+                return player;
+            }
+        }
+        return null;
+    }
+
+    /** Small feedback so it is clear which colour is the smart-dice admin now. */
+    private void showAdminToast(String color, boolean enabled) {
+        if (color == null || color.isEmpty()) {
+            return;
+        }
+        String cap = color.substring(0, 1).toUpperCase() + color.substring(1);
+        Toast.makeText(MainActivity.this,
+                "Smart dice: " + cap + (enabled ? " ON" : " OFF"),
+                Toast.LENGTH_SHORT).show();
     }
 
     /** Admin pieces can only be cut within the last 12 steps before home. */
@@ -1359,26 +1382,19 @@ public class MainActivity extends AppCompatActivity {
                     return;
                 }
 
-                // Smart dice turns on exactly on the dice/corner that was long
-                // pressed, no matter whose turn is currently showing.
+                // The colour that was long pressed becomes the admin: a corner
+                // pad maps to the player sitting on that corner, and a press on
+                // the central dice maps to the player whose turn is showing.
                 int pressedCorner = findPressedCornerPosition(smartLastTouchRawX, smartLastTouchRawY);
                 if (pressedCorner > 0) {
                     activateSmartDiceForCorner(pressedCorner);
                     return;
                 }
-
-                if (!smartDiceOwnerLocked) {
-                    if (isCurrentPlayerBindable()) {
-                        smartDiceOwner = this;
-                        smartDiceOwnerColor = currentPlayerColor;
-                        smartDiceOwnerPlayerIndex = currentPlayerSelectedIndex;
-                        smartDiceEnabled = true;
-                        smartDiceOwnerLocked = true;
+                if (isCurrentPlayerBindable()) {
+                    Player current = findPlayerByColor(currentPlayerColor);
+                    if (current != null) {
+                        selectSmartDiceAdmin(current);
                     }
-                } else if (smartDiceOwner == this
-                        && smartDiceOwnerPlayerIndex == currentPlayerSelectedIndex
-                        && Objects.equals(smartDiceOwnerColor, currentPlayerColor)) {
-                    smartDiceEnabled = !smartDiceEnabled;
                 }
             };
 
@@ -1411,9 +1427,9 @@ public class MainActivity extends AppCompatActivity {
                 }
             });
 
-            // Every corner dice pad listens for the 5s long press too, so the
-            // owner can activate smart dice on their own color at any moment,
-            // even while another player's turn is on screen.
+            // Every corner dice pad also listens for the 3s long press, so any
+            // player's colour can be selected as the smart-dice admin at any
+            // moment, even while another player's turn is on screen.
             attachSmartCornerLongPress(tLeftLayout);
             attachSmartCornerLongPress(tRightLayout);
             attachSmartCornerLongPress(bLeftLayout);
@@ -1511,10 +1527,9 @@ public class MainActivity extends AppCompatActivity {
         }
 
         /**
-         * Long press on a corner dice pad activates smart dice for the player
-         * who owns that corner — regardless of whose turn it is. Pressing the
-         * same corner again toggles it off/on. Other corners are ignored once
-         * an owner is locked in, so the owner stays for the whole game.
+         * Long press on a corner dice pad makes the player who owns that
+         * corner the smart-dice admin — regardless of whose turn is on
+         * screen. Pressing the SAME corner again toggles the assist off/on.
          */
         void attachSmartCornerLongPress(View cornerBox) {
             cornerBox.setOnTouchListener(new View.OnTouchListener() {
@@ -1577,23 +1592,37 @@ public class MainActivity extends AppCompatActivity {
                     break;
                 }
             }
-            // Bot corners never take over smart dice; their pads stay ignored.
-            if (cornerPlayer == null || cornerPlayer.isBot) {
+            // Empty/hidden corner pad: nobody to select, nothing happens.
+            if (cornerPlayer == null) {
                 return;
             }
+            selectSmartDiceAdmin(cornerPlayer);
+        }
 
-            if (!smartDiceOwnerLocked) {
-                smartDiceOwner = this;
-                smartDiceOwnerColor = cornerPlayer.getColor();
-                smartDiceOwnerPlayerIndex = cornerPlayer.getIndex();
-                smartDiceEnabled = true;
-                smartDiceOwnerLocked = true;
-            } else if (smartDiceOwnerPlayerIndex == cornerPlayer.getIndex()
-                    && Objects.equals(smartDiceOwnerColor, cornerPlayer.getColor())) {
+        /**
+         * Makes the passed player the smart-dice admin. The pressed pad's
+         * colour now owns the assist: six-quota rolls, cut-protection and the
+         * admin-first rule all follow that colour. Long-pressing the SAME
+         * player's pad again toggles the dice assist off/on (protection rules
+         * stay on for the current admin).
+         */
+        void selectSmartDiceAdmin(Player player) {
+            boolean sameAsCurrent = smartDiceOwnerLocked
+                    && smartDiceOwnerPlayerIndex == player.getIndex()
+                    && Objects.equals(smartDiceOwnerColor, player.getColor());
+            if (sameAsCurrent) {
                 smartDiceEnabled = !smartDiceEnabled;
+                showAdminToast(player.getColor(), smartDiceEnabled);
+                return;
             }
-            // Pressing a different player's corner while locked changes nothing:
-            // the first owner keeps smart dice for the whole game.
+            // Any player's pad can become the admin — whichever colour was
+            // long pressed takes over protections + priority immediately.
+            smartDiceOwner = this;
+            smartDiceOwnerColor = player.getColor();
+            smartDiceOwnerPlayerIndex = player.getIndex();
+            smartDiceOwnerLocked = true;
+            smartDiceEnabled = true;
+            showAdminToast(player.getColor(), true);
         }
 
         boolean isCurrentPlayerBindable() {
@@ -2971,9 +3000,9 @@ public class MainActivity extends AppCompatActivity {
             isGameSessionActive = true;
             isQuitConfirmed = false;
             clearSavedGameSnapshot();
-            // The phone owner (first human player) is the admin from the very
-            // start: protections & priority are always on. The 3s long press
-            // only toggles the dice-assist rolls on/off for this owner.
+            // Default smart-dice admin = phone owner (first human player).
+            // Long-press ANY player's dice pad (3s) to make that colour the
+            // admin — protections & priority follow the selected colour.
             initAdminOwner();
         RelativeLayout.LayoutParams lp = new RelativeLayout.LayoutParams(((int)(pxWidth*0.4)),((int)(pxWidth*0.4)));
         redHomeBlink.setLayoutParams(lp);
